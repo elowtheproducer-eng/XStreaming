@@ -1,0 +1,63 @@
+name: Build tilt APK
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      YARN_ENABLE_IMMUTABLE_INSTALLS: "false"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Enable Yarn
+        run: corepack enable
+
+      - name: Apply tilt patch
+        run: python3 .github/apply_tilt_patch.py
+
+      - name: Install JS dependencies
+        run: yarn install
+
+      - name: Build release APK (debug-signed, arm64 only)
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleRelease --no-daemon \
+            -PreactNativeArchitectures=arm64-v8a \
+            -PXSTREAMING_RELEASE_STORE_FILE=debug.keystore \
+            -PXSTREAMING_RELEASE_KEY_ALIAS=androiddebugkey \
+            -PXSTREAMING_RELEASE_STORE_PASSWORD=android \
+            -PXSTREAMING_RELEASE_KEY_PASSWORD=android
+
+      - name: Sign if the APK came out unsigned
+        run: |
+          cd android/app/build/outputs/apk/release
+          ls -la
+          if ls *unsigned*.apk >/dev/null 2>&1; then
+            BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+            "$BT/zipalign" -f -p 4 *unsigned*.apk aligned.apk
+            "$BT/apksigner" sign \
+              --ks "$GITHUB_WORKSPACE/android/app/debug.keystore" \
+              --ks-pass pass:android --key-pass pass:android \
+              --ks-key-alias androiddebugkey \
+              --out xstreaming-tilt.apk aligned.apk
+            rm -f aligned.apk *unsigned*.apk
+          fi
+          ls -la
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xstreaming-tilt-apk
+          path: android/app/build/outputs/apk/release/*.apk
