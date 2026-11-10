@@ -29,13 +29,15 @@ jobs:
 
       - name: Install JS dependencies
         run: yarn install
+
       - name: Add Rust Android target
         run: rustup target add aarch64-linux-android
-      - name: Build release APK (debug-signed, arm64 only)
+
+      - name: Build dev release APK (debug-signed, arm64 only)
         working-directory: android
         run: |
           chmod +x gradlew
-          ./gradlew assembleRelease --no-daemon \
+          ./gradlew assembleDevRelease --no-daemon \
             -PreactNativeArchitectures=arm64-v8a \
             -PXSTREAMING_RELEASE_STORE_FILE=debug.keystore \
             -PXSTREAMING_RELEASE_KEY_ALIAS=androiddebugkey \
@@ -44,7 +46,7 @@ jobs:
 
       - name: Sign if the APK came out unsigned
         run: |
-          cd android/app/build/outputs/apk/release
+          cd android/app/build/outputs/apk/dev/release
           ls -la
           if ls *unsigned*.apk >/dev/null 2>&1; then
             BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
@@ -61,4 +63,4 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: xstreaming-tilt-apk
-          path: android/app/build/outputs/apk/release/*.apk
+          path: android/app/build/outputs/apk/dev/release/*.apk
