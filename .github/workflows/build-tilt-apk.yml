@@ -29,7 +29,8 @@ jobs:
 
       - name: Install JS dependencies
         run: yarn install
-
+      - name: Add Rust Android target
+        run: rustup target add aarch64-linux-android
       - name: Build release APK (debug-signed, arm64 only)
         working-directory: android
         run: |
