@@ -1702,7 +1702,7 @@ def patch_sensor_module():
     m = one(text, r"public\s+void\s+stopSensor\s*\(\s*\)\s*\{", path, "stopSensor()", kw)
     text = splice(text, m.end(), m.end(), "\n        HeadLog.w(\"SensorModule\", \"stopSensor() called -> stops head tracking\", new Throwable(\"stopSensor caller\"));\n        stopHeadTrack();")
 
-    m = one(text, r"public\s+SensorModule\s*\([^)]*\)\s*\{", path, "SensorModule constructor", kw)
+    m = one(text, r"public\s+SensorModule\s*\([^)]*\)\s*\{\s*super\s*\([^)]*\)\s*;", path, "SensorModule constructor super(...) call", kw)
     text = splice(text, m.end(), m.end(), "\n        HeadLog.install(reactContext); HeadLog.attach(reactContext.getCurrentActivity()); HeadLog.i(\"SensorModule\", \"module constructed\");")
     m = one(text, r"(?:public|private)\s+void\s+sendEvent\s*\([^)]*\)\s*\{", path, "sendEvent body", kw)
     text = splice(text, m.end(), m.end(), "\n        HeadLog.count(\"sendEvent:\" + eventName + (reactContext.hasActiveReactInstance() ? \"\" : \":NO_REACT_INSTANCE\"));")
