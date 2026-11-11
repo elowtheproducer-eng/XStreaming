@@ -1009,13 +1009,8 @@ public final class HeadCamera implements LifecycleOwner {
             ByteBuffer buf = plane.getBuffer();
             final int rowStride = plane.getRowStride();
 
-            int bi = c.sync_infer ? 0 : (bmpIdx ^= 1);   // ping-pong in async mode so MediaPipe never reads a bitmap we are rewriting
-            Bitmap bmp = bitmaps[bi];
-            if (bmp == null || bmp.getWidth() != w || bmp.getHeight() != h) {
-                if (bmp != null) bmp.recycle();
-                bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
-                bitmaps[bi] = bmp;
-            }
+            // fresh bitmap per frame: closing an MPImage recycles its bitmap, so reuse crashes on frame 2
+            Bitmap bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
             buf.rewind();
             if (rowStride == w * 4) {
                 bmp.copyPixelsFromBuffer(buf);
@@ -2051,6 +2046,9 @@ def patch_native_stream():
     m = one(text, r"\bif\s*\(\s*tiltOn\s*\)\s*\{", path, "if (tiltOn) { ... } start block", kw)
     text = splice(text, m.start(), m.end(), JS_START.replace("@S@", sv).replace("@SM@", sm))
 
+    # show the existing 're-centre' item for every Device-gyro mode (motion, tilt, head); no new items added
+    m = one(text, r"if\s*\(\s*([A-Za-z_$][\w$.]*)\.sensor\s*===\s*1\s*&&\s*\1\.sensor_mode\s*===\s*1\s*\)\s*\{\s*[A-Za-z_$][\w$.]*\.push\(\s*\{[^{}]*?id:\s*['\"]recenterTilt['\"]", path, "recenterTilt menu condition", kw, re.S)
+    text = text[:m.start()] + text[m.start():m.end()].replace(".sensor_mode === 1", ".sensor_mode !== undefined", 1) + text[m.end():]
     # (menu edits intentionally removed: they broke pause-menu scrolling)
 
     write(path, text, crlf)
