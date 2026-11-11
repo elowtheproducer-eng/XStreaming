@@ -1643,17 +1643,28 @@ def patch_setting_store():
 # ----------------------------------------------------------------------------------------------
 # 4. NativeStream.tsx
 # ----------------------------------------------------------------------------------------------
-JS_START = r'''if (headOn) {
-        // HEADTRACK: camera head tracking (needs CAMERA permission)
-        try {
+JS_SETUP = r'''// HEADTRACK: remember config + helpers so the in-stream toggles can start/stop modes
+      try {
+        const _c: any = {
+          head: {},
+          tiltRange: @S@.tilt_range_deg || 30,
+          tiltDz: @S@.tilt_deadzone_deg ?? 2,
+        };
+        Object.keys(@S@).forEach((k: string) => {
+          if (k.indexOf('head_') === 0) {
+            _c.head[k.slice(5)] = (@S@ as any)[k];
+          }
+        });
+        const _g: any = globalThis as any;
+        _g.__xsCfg = _c;
+        _g.__xsSensor = headOn ? 'head' : tiltOn ? 'tilt' : 'other';
+        _g.__xsStartTilt = () => {
+          @SM@.startTilt(_c.tiltRange, _c.tiltDz, false, false);
+        };
+        _g.__xsStartHead = () => {
           const _rn = require('react-native');
-          const _hc: any = {};
-          Object.keys(@S@).forEach((k: string) => {
-            if (k.indexOf('head_') === 0) {
-              _hc[k.slice(5)] = (@S@ as any)[k];
-            }
-          });
-          (globalThis as any).__xsHead = {
+          const _hc: any = Object.assign({}, _c.head);
+          _g.__xsHead = {
             cam: _hc.camera || 0,
             mode: _hc.output_mode || 0,
             gain: _hc.flick_gain || 20,
@@ -1674,12 +1685,54 @@ JS_START = r'''if (headOn) {
               );
             }
           });
+        };
+      } catch (e) {
+        console.warn('Head tracking setup failed', e);
+      }'''
+
+JS_START = r'''if (headOn) {
+        try {
+          (globalThis as any).__xsStartHead();
         } catch (e) {
           console.warn('Head tracking start failed', e);
         }
       } else if (tiltOn) {'''
 
-JS_CASES = r'''case 'recenterHead':
+JS_CASES = r'''case 'toggleHeadTracking': {
+        const _g: any = globalThis as any;
+        const _rn = require('react-native');
+        if (_g.__xsSensor === 'head') {
+          @SM@.stopHeadTrack();
+          _g.__xsSensor = 'off';
+          try { tiltActive.current = false; } catch (e) {}
+          _rn.ToastAndroid.show('Head tracking off', _rn.ToastAndroid.SHORT);
+        } else {
+          @SM@.stopSensor();
+          _g.__xsStartHead();
+          _g.__xsSensor = 'head';
+          try { tiltActive.current = true; } catch (e) {}
+          _rn.ToastAndroid.show('Head tracking on', _rn.ToastAndroid.SHORT);
+        }
+        break;
+      }
+      case 'toggleGyroTilt': {
+        const _g: any = globalThis as any;
+        const _rn = require('react-native');
+        if (_g.__xsSensor === 'tilt') {
+          @SM@.stopSensor();
+          _g.__xsSensor = 'off';
+          try { tiltActive.current = false; } catch (e) {}
+          _rn.ToastAndroid.show('Gyro tilt off', _rn.ToastAndroid.SHORT);
+        } else {
+          @SM@.stopSensor();
+          _g.__xsStartTilt();
+          _g.__xsSensor = 'tilt';
+          try { tiltActive.current = true; } catch (e) {}
+          _rn.ToastAndroid.show('Gyro tilt on', _rn.ToastAndroid.SHORT);
+        }
+        break;
+      }
+      case 'recenterHead':
         @SM@.headRecenter();
         break;
       case 'switchHeadCamera': {
@@ -1736,6 +1789,8 @@ JS_CASES = r'''case 'recenterHead':
       }'''
 
 MENU = [
+    ("toggleHeadTracking", "Toggle head tracking"),
+    ("toggleGyroTilt", "Toggle gyro tilt"),
     ("recenterHead", "Re-centre head"),
     ("switchHeadCamera", "Head: switch front/rear camera"),
     ("switchHeadMode", "Head: switch Hold/Flick"),
@@ -1774,7 +1829,8 @@ def patch_native_stream():
 
     # 2. tiltActive gate: reuse it so the gyro gate / scale bypass applies to head mode
     m = one(text, r"tiltActive\.current\s*=\s*tiltOn\s*;", path, "tiltActive.current = tiltOn;", kw)
-    text = splice(text, m.start(), m.end(), "tiltActive.current = tiltOn || headOn;")
+    text = splice(text, m.start(), m.end(),
+                  "tiltActive.current = tiltOn || headOn;\n" + JS_SETUP.replace("@S@", sv).replace("@SM@", sm))
 
     # 3. start branch
     m = one(text, r"\bif\s*\(\s*tiltOn\s*\)\s*\{", path, "if (tiltOn) { ... } start block", kw)
@@ -1785,7 +1841,10 @@ def patch_native_stream():
            r"(?P<arr>[A-Za-z_$][\w$.]*)\.push\(\s*\{[^{}]*?id:\s*['\"]recenterTilt['\"][^{}]*\}\s*\)\s*;?\s*\}")
     m = one(text, pat, path, "the 'recenterTilt' menu item block", kw, re.S)
     ind, cond, arr = m.group("indent"), m.group("cond"), m.group("arr")
-    cond2 = re.sub(r"(sensor_mode\s*={2,3}\s*)1", r"\g<1>2", cond)
+    # show the head/toggle items whenever the gyro is enabled, in ANY sensor mode
+    cond2 = re.sub(r"\s*&&\s*[^&|]*sensor_mode[^&|]*", "", cond)
+    if cond2.strip() == cond.strip() or not cond2.strip():
+        cond2 = re.sub(r"(sensor_mode\s*={2,3}\s*)1", r"\g<1>2", cond)
     uses_t = re.search(r"title:\s*t\(", m.group(0)) is not None
     lines = ["", "%sif (%s) {  // HEADTRACK" % (ind, cond2)]
     for mid, title in MENU:
