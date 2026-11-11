@@ -1009,8 +1009,18 @@ public final class HeadCamera implements LifecycleOwner {
             ByteBuffer buf = plane.getBuffer();
             final int rowStride = plane.getRowStride();
 
-            // fresh bitmap per frame: closing an MPImage recycles its bitmap, so reuse crashes on frame 2
-            Bitmap bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
+            // sync mode: one reused bitmap, and the MPImage is never closed (closing recycles the bitmap).
+            // async mode: MediaPipe closes the image itself, so a fresh bitmap per frame.
+            Bitmap bmp;
+            if (c.sync_infer) {
+                bmp = bitmaps[0];
+                if (bmp == null || bmp.isRecycled() || bmp.getWidth() != w || bmp.getHeight() != h) {
+                    bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
+                    bitmaps[0] = bmp;
+                }
+            } else {
+                bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
+            }
             buf.rewind();
             if (rowStride == w * 4) {
                 bmp.copyPixelsFromBuffer(buf);
@@ -1063,7 +1073,6 @@ public final class HeadCamera implements LifecycleOwner {
                 errorStreak = 0;
             }
         } finally {
-            if (mp != null) { try { mp.close(); } catch (Throwable ignored) {} }
             proxy.close();
         }
     }
@@ -1130,7 +1139,7 @@ public final class HeadTracker {
 
     // ---- tunables (direction to move them is in the comment) ----
     private static final long TICK_MS = 8;                    // ticker period (~125 Hz)
-    private static final long MIN_EMIT_MS = 7;                // never emit faster than this (JS thread load)
+    private static final long MIN_EMIT_MS = 15;                // never emit faster than this (JS thread load)
     private static final double SA_MOVE = 2500.0;             // Kalman agility in motion (deg/s^2). Up = less lag, more noise
     private static final double SA_REST_FLICK = 350.0;        // Kalman calm-at-rest for Flick
     private static final double SIGMA_YAW = 0.7, SIGMA_PITCH = 1.0;   // measurement noise at ipd 70 px (deg)
@@ -1727,7 +1736,7 @@ NOYES = [(0, "No"), (1, "Yes")]
 #   slider -> extra = (min, max, step)
 SETTINGS = [
     ("head_camera", "radio", "Head tracking camera", "Which camera watches your head. You can also switch in the stream menu.", [(0, "Front"), (1, "Rear")], 0),
-    ("head_output_mode", "radio", "Head tracking mode", "Hold = head angle is the stick (racing, flight, cockpit). Flick = virtual mouse: move your head away from centre to turn, come back freely (shooters, action).", [(0, "Hold (angle = stick)"), (1, "Flick (virtual mouse)")], 0),
+    ("head_output_mode", "radio", "Head tracking mode", "Hold = head angle is the stick (racing, flight, cockpit). Flick = virtual mouse: move your head away from centre to turn, come back freely (shooters, action).", [(0, "Hold (angle = stick)"), (1, "Flick (virtual mouse)")], 1),
     ("head_invert_x", "radio", "Invert head left/right", "Turn on if the view goes the wrong way when you turn your head sideways.", NOYES, 0),
     ("head_invert_y", "radio", "Invert head up/down", "Turn on if the view goes the wrong way when you look up or down.", NOYES, 0),
     ("head_yaw_range", "slider", "Hold: left/right head range (degrees)", "Head turn needed for full stick left or right.", (15, 70, 5), 35),
@@ -1752,7 +1761,7 @@ SETTINGS = [
     ("head_auto_zoom", "radio", "Auto zoom", "Zooms the camera so your face stays big enough for accurate tracking.", ONOFF, 1),
     ("head_haptics", "radio", "Head tracking vibration cues", "Vibrate when your face is found / lost, and on recentre.", ONOFF, 1),
     ("head_delegate", "radio", "Face model runs on", "Auto tries the GPU and falls back to the CPU. Try CPU if the game stutters.", [(0, "Auto"), (1, "GPU"), (2, "CPU")], 0),
-    ("head_fps", "radio", "Camera frame rate", "Auto = default.", [(0, "Auto"), (30, "30"), (60, "60")], 0),
+    ("head_fps", "radio", "Camera frame rate", "60 is smoothest (falls back automatically if the camera cannot).", [(0, "Auto"), (30, "30"), (60, "60")], 60),
     ("head_raw_landmarks", "radio", "Raw landmarks (A/B test)", "Turns off MediaPipe's built-in smoothing. Compare feel and the CSV log.", ONOFF, 0),
 ]
 
@@ -1850,6 +1859,21 @@ JS_SETUP = r'''// HEADTRACK: remember config + helpers so the in-stream toggles 
         });
         const _g: any = globalThis as any;
         _g.__xsCfg = _c;
+        try {
+          const _stg = require('../store/mmkv').storage;
+          if (!_stg.getBoolean('head_defaults_v3')) {
+            const _ss = require('../store/settingStore');
+            const _nw: any = Object.assign({}, _ss.getSettings(), {
+              head_output_mode: 1, head_flick_preset: 1, head_flick_gain: 20,
+              head_flick_glide: 4, head_flick_deadzone: 14, head_flick_accel: 30, head_fps: 60,
+            });
+            _ss.saveSettings(_nw);
+            _stg.set('head_defaults_v3', true);
+            Object.keys(_nw).forEach((k: string) => {
+              if (k.indexOf('head_') === 0) { _c.head[k.slice(5)] = _nw[k]; }
+            });
+          }
+        } catch (e5) {}
         try {
           const _rn0 = require('react-native');
           @SM@.headLog('JS setup ran. headOn=' + headOn + ' tiltOn=' + tiltOn + ' sensor=' + @S@.sensor + ' mode=' + @S@.sensor_mode + ' sensor_type=' + @S@.sensor_type);
