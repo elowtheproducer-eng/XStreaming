@@ -283,6 +283,106 @@ public final class HeadLog {
     }
 }
 '''
+JAVA['GyroEnhance'] = r'''package com.xstreaming;
+
+/** Smoothing, curve, game-deadzone skip, Flick and speed boost for the Tilt and Motion gyro modes. Pure math. */
+public final class GyroEnhance {
+    private volatile int smooth = 4;
+    private volatile double expo = 1.0, gameDz = 0.0, accel = 0.0;
+    private volatile int tiltInvert = 0, tiltOutput = 0;
+
+    private final HeadFilters.OneEuro tRoll = new HeadFilters.OneEuro(), tPitch = new HeadFilters.OneEuro();
+    private final HeadFilters.OneEuro mXf = new HeadFilters.OneEuro(), mYf = new HeadFilters.OneEuro();
+    private final HeadFlick.FlickAxis axX = new HeadFlick.FlickAxis(), axY = new HeadFlick.FlickAxis();
+    private final HeadFlick.FlickCfg fcfg = new HeadFlick.FlickCfg();
+    private long lastTiltTs = 0, lastMotionTs = 0;
+    private double prevX, prevY, omX, omY;
+    private boolean havePrev, activeX, activeY;
+
+    public volatile double outX = 0.0, outY = 0.0;   // tilt result, -1..1
+    public volatile double mx = 0.0, my = 0.0;       // filtered motion rates (rad/s)
+
+    public void configure(int smooth, double expo, double gameDz, double accel, int tiltInvert, int tiltOutput, int preset) {
+        this.smooth = Math.max(0, Math.min(10, smooth));
+        this.expo = Math.max(1.0, Math.min(3.0, expo));
+        this.gameDz = Math.max(0.0, Math.min(0.4, gameDz));
+        this.accel = Math.max(0.0, Math.min(1.0, accel));
+        this.tiltInvert = tiltInvert;
+        this.tiltOutput = tiltOutput;
+        double mc = 6.0 * Math.pow(0.78, this.smooth);
+        tRoll.minCut = mc; tRoll.beta = 4.0;
+        tPitch.minCut = mc; tPitch.beta = 4.0;
+        mXf.minCut = mc; mXf.beta = 0.5;
+        mYf.minCut = mc; mYf.beta = 0.5;
+        int p = Math.max(0, Math.min(3, preset));
+        fcfg.gain = HeadFlick.PRESET_GAIN[p];
+        fcfg.tauPay = HeadFlick.PRESET_TAU[p];
+        fcfg.accel = HeadFlick.PRESET_ACCEL[p];
+        fcfg.gameDz = this.gameDz;
+        resetTilt();
+        resetMotion();
+    }
+
+    public void resetTilt() {
+        tRoll.reset(); tPitch.reset(); axX.reset(); axY.reset();
+        lastTiltTs = 0; havePrev = false; omX = 0; omY = 0; outX = 0; outY = 0; activeX = false; activeY = false;
+    }
+
+    public void resetMotion() {
+        mXf.reset(); mYf.reset(); lastMotionTs = 0; mx = 0; my = 0;
+    }
+
+    public void tilt(long tsNs, double dRollDeg, double dPitchDeg, double rangeDeg, double deadDeg) {
+        double dt = lastTiltTs == 0 ? 0.01 : (tsNs - lastTiltTs) / 1e9;
+        lastTiltTs = tsNs;
+        if (dt <= 0 || dt > 0.1) dt = 0.01;
+        double tx = -dRollDeg, ty = dPitchDeg;
+        double fx = smooth > 0 ? tRoll.filter(tx, dt) : tx;
+        double fy = smooth > 0 ? tPitch.filter(ty, dt) : ty;
+        double invX = (tiltInvert & 1) != 0 ? -1.0 : 1.0;
+        double invY = (tiltInvert & 2) != 0 ? -1.0 : 1.0;
+        if (tiltOutput == 1) {
+            if (havePrev) {
+                omX += 0.3 * ((fx - prevX) / dt - omX);
+                omY += 0.3 * ((fy - prevY) / dt - omY);
+            }
+            prevX = fx; prevY = fy; havePrev = true;
+            fcfg.band = Math.max(1.5, deadDeg);
+            outX = invX * axX.step(fx, omX, dt, fcfg, false);
+            outY = invY * axY.step(fy, omY, dt, fcfg, false);
+        } else {
+            double x = HeadMapper.shape(fx, rangeDeg, rangeDeg, deadDeg, expo, gameDz, activeX);
+            double y = HeadMapper.shape(fy, rangeDeg, rangeDeg, deadDeg, expo, gameDz, activeY);
+            activeX = x != 0.0; activeY = y != 0.0;
+            outX = invX * x;
+            outY = invY * y;
+        }
+    }
+
+    public void motion(long tsNs, double yawRoll, double pitch) {
+        double dt = lastMotionTs == 0 ? 0.005 : (tsNs - lastMotionTs) / 1e9;
+        lastMotionTs = tsNs;
+        if (dt <= 0 || dt > 0.1) { dt = 0.005; mXf.reset(); mYf.reset(); mx = 0; my = 0; }
+        if (smooth > 0) {
+            mx = mXf.filter(yawRoll, dt);
+            my = mYf.filter(pitch, dt);
+        } else {
+            mx = 0.4 * yawRoll + 0.6 * mx;
+            my = 0.4 * pitch + 0.6 * my;
+        }
+    }
+
+    public int motionOut(double rate, double scale) {
+        double n = rate * scale / 32767.0;
+        if (Math.abs(n) < 0.0003) return 0;
+        if (accel > 0.0) n *= 1.0 + accel * (2.0 * HeadFilters.smoothstep(0.4, 4.0, Math.abs(rate)) - 1.0);
+        double a = Math.min(1.0, Math.abs(n));
+        if (expo != 1.0) a = Math.pow(a, expo);
+        if (gameDz > 0.0) a = gameDz + (1.0 - gameDz) * a;
+        return (int) Math.round(Math.copySign(a, n) * 32767.0);
+    }
+}
+'''
 JAVA['HeadConfig'] = r'''package com.xstreaming;
 
 import com.facebook.react.bridge.ReadableMap;
@@ -1688,6 +1788,24 @@ SENSOR_METHODS = r'''
 '''
 
 
+GYRO_METHODS = """
+    @ReactMethod
+    public void setGyroEnhance(com.facebook.react.bridge.ReadableMap m) {
+        try {
+            enh.configure((int) gnum(m, "smooth", 4), gnum(m, "expo", 1.0), gnum(m, "gameDz", 0.0), gnum(m, "accel", 0.0),
+                    (int) gnum(m, "tiltInvert", 0), (int) gnum(m, "tiltOutput", 0), (int) gnum(m, "preset", 1));
+            HeadLog.i("SensorModule", "setGyroEnhance " + m);
+        } catch (Throwable t) {
+            HeadLog.e("SensorModule", "setGyroEnhance failed", t);
+        }
+    }
+
+    private static double gnum(com.facebook.react.bridge.ReadableMap m, String k, double d) {
+        try { return (m.hasKey(k) && !m.isNull(k)) ? m.getDouble(k) : d; } catch (Throwable t) { return d; }
+    }
+"""
+
+
 def patch_sensor_module():
     path = JAVA_DIR + "/SensorModule.java"
     text, crlf = read(path)
@@ -1697,7 +1815,7 @@ def patch_sensor_module():
     kw = ("class SensorModule", "recenter", "stopSensor", "sendEvent")
 
     m = one(text, r"public\s+class\s+SensorModule\b[^{]*\{", path, "class declaration", kw)
-    text = splice(text, m.end(), m.end(), "\n    // HEADTRACK\n    private HeadTracker headTracker = null;\n")
+    text = splice(text, m.end(), m.end(), "\n    // HEADTRACK\n    private HeadTracker headTracker = null;\n    private final GyroEnhance enh = new GyroEnhance();\n")
 
     m = one(text, r"public\s+void\s+recenter\s*\(\s*\)\s*\{", path,
             "recenter() (the tilt patch must run first)", kw)
@@ -1717,10 +1835,36 @@ def patch_sensor_module():
     elif not re.search(r"\bvoid\s+sendEvent\s*\(", text):
         die("Could not find a sendEvent(String, WritableMap) method in SensorModule.", path, text, kw)
 
+    text = re.sub(r"MIN_EMIT_INTERVAL_MS\s*=\s*10\s*;", "MIN_EMIT_INTERVAL_MS = 15;", text, count=1)
+    text = re.sub(r"registerListener\(\s*this\s*,\s*rot\s*,\s*SensorManager\.SENSOR_DELAY_GAME\s*\)",
+                  "registerListener(this, rot, SensorManager.SENSOR_DELAY_FASTEST)", text, count=1)
+    m = one(text, r"float\s+x\s*=\s*-tiltAxis\(dRoll\)\s*\*\s*tiltInvX;.*?if\s*\(Math\.abs\(oy\)\s*<\s*150\)\s*oy\s*=\s*0;", path,
+            "tilt output block in handleTilt", kw, re.S)
+    text = splice(text, m.start(), m.end(),
+        "enh.tilt(event.timestamp, Math.toDegrees(dRoll), Math.toDegrees(dPitch), Math.toDegrees(tiltRangeRad), Math.toDegrees(tiltDeadRad));\n"
+        "        long now = SystemClock.elapsedRealtime();\n"
+        "        if (now - lastTiltEmit < MIN_EMIT_INTERVAL_MS) return;\n"
+        "        int ox = (int) Math.round(enh.outX * 32767.0);\n"
+        "        int oy = (int) Math.round(enh.outY * 32767.0);\n"
+        "        if (Math.abs(ox) < 60) ox = 0;\n"
+        "        if (Math.abs(oy) < 60) oy = 0;")
+    m = one(text, r"recenterPending\s*=\s*false\s*;", path, "recenterPending = false in handleTilt", kw)
+    text = splice(text, m.end(), m.end(), " enh.resetTilt();")
+    m = one(text, r"filteredX\s*=\s*\(SMOOTHING_ALPHA\s*\*\s*yawRoll\)[^;]*;\s*filteredY\s*=\s*\(SMOOTHING_ALPHA\s*\*\s*pitch\)[^;]*;", path,
+            "motion smoothing lines", kw, re.S)
+    text = splice(text, m.start(), m.end(),
+        "enh.motion(event.timestamp, yawRoll, pitch);\n            filteredX = (float) enh.mx;\n            filteredY = (float) enh.my;")
+    m = one(text, r"int\s+roundX\s*=\s*Math\.round\(\s*filteredX\s*\*\s*scaleX\s*\)\s*;", path, "roundX", kw)
+    text = splice(text, m.start(), m.end(), "int roundX = enh.motionOut(filteredX, scaleX);")
+    m = one(text, r"int\s+roundY\s*=\s*Math\.round\(\s*filteredY\s*\*\s*scaleY\s*\)\s*;", path, "roundY", kw)
+    text = splice(text, m.start(), m.end(), "int roundY = enh.motionOut(filteredY, scaleY);")
+    m = one(text, r"public\s+void\s+startSensor\s*\([^)]*\)\s*\{", path, "startSensor()", kw)
+    text = splice(text, m.end(), m.end(), "\n        enh.resetMotion();")
+
     end = text.rstrip().rfind("}")
     if end < 0:
         die("Could not find the closing brace of the class.", path, text, kw)
-    text = splice(text, end, end, SENSOR_METHODS + "\n")
+    text = splice(text, end, end, SENSOR_METHODS + GYRO_METHODS + "\n")
     write(path, text, crlf)
     print("  patched", path)
 
@@ -1762,6 +1906,13 @@ SETTINGS = [
     ("head_haptics", "radio", "Head tracking vibration cues", "Vibrate when your face is found / lost, and on recentre.", ONOFF, 1),
     ("head_delegate", "radio", "Face model runs on", "Auto tries the GPU and falls back to the CPU. Try CPU if the game stutters.", [(0, "Auto"), (1, "GPU"), (2, "CPU")], 0),
     ("head_fps", "radio", "Camera frame rate", "60 is smoothest (falls back automatically if the camera cannot).", [(0, "Auto"), (30, "30"), (60, "60")], 60),
+    ("gyro_smooth", "slider", "Gyro (Motion/Tilt): smoothing", "Removes jitter in Motion and Tilt modes. 0 = off. Higher = smoother, slightly slower.", (0, 10, 1), 4),
+    ("gyro_expo", "slider", "Gyro (Motion/Tilt): curve (10 = linear)", "Higher = finer control for small movements.", (10, 25, 1), 10),
+    ("gyro_game_dz", "slider", "Gyro (Motion/Tilt): game's right-stick deadzone (%)", "Raise if small movements do nothing and then jump.", (0, 30, 1), 0),
+    ("gyro_accel", "slider", "Motion: speed boost (%)", "Fast movements turn more than slow ones. 0 = off.", (0, 100, 5), 0),
+    ("gyro_tilt_invert", "radio", "Tilt: invert", "Flip the tilt direction.", [(0, "None"), (1, "Left/right"), (2, "Up/down"), (3, "Both")], 0),
+    ("gyro_tilt_output", "radio", "Tilt: output", "Hold = angle is the stick. Flick = virtual mouse: tilt away to turn, return freely.", [(0, "Hold"), (1, "Flick")], 0),
+    ("gyro_flick_preset", "radio", "Tilt Flick: feel", "Pre-tuned response when Tilt output is Flick.", [(0, "Precise"), (1, "Balanced"), (2, "Snappy"), (3, "Spin")], 1),
     ("head_raw_landmarks", "radio", "Raw landmarks (A/B test)", "Turns off MediaPipe's built-in smoothing. Compare feel and the CSV log.", ONOFF, 0),
 ]
 
@@ -1874,6 +2025,18 @@ JS_SETUP = r'''// HEADTRACK: remember config + helpers so the in-stream toggles 
             });
           }
         } catch (e5) {}
+        try {
+          const _n = (v: any, d: number) => (v === undefined || v === null || isNaN(Number(v)) ? d : Number(v));
+          @SM@.setGyroEnhance({
+            smooth: _n(@S@.gyro_smooth, 4),
+            expo: _n(@S@.gyro_expo, 10) / 10,
+            gameDz: _n(@S@.gyro_game_dz, 0) / 100,
+            accel: _n(@S@.gyro_accel, 0) / 100,
+            tiltInvert: _n(@S@.gyro_tilt_invert, 0),
+            tiltOutput: _n(@S@.gyro_tilt_output, 0),
+            preset: _n(@S@.gyro_flick_preset, 1),
+          });
+        } catch (e6) {}
         try {
           const _rn0 = require('react-native');
           @SM@.headLog('JS setup ran. headOn=' + headOn + ' tiltOn=' + tiltOn + ' sensor=' + @S@.sensor + ' mode=' + @S@.sensor_mode + ' sensor_type=' + @S@.sensor_type);
