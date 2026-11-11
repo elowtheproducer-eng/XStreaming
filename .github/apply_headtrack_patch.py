@@ -137,7 +137,7 @@ public final class HeadConfig {
     public boolean neutral_creep = true;
     public int delegate = 0;             // 0 Auto(GPU->CPU fallback), 1 GPU, 2 CPU
     public boolean multi_face = false;
-    public boolean diag_overlay = false;
+    public boolean diag_overlay = true;   // TEST BUILD: on-screen status toasts. Set 0 in settings to hide
 
     public HeadConfig copy() {
         HeadConfig c = new HeadConfig();
@@ -917,11 +917,13 @@ import android.media.AudioManager;
 import android.media.ToneGenerator;
 import android.os.Build;
 import android.os.Handler;
+import android.os.Looper;
 import android.os.HandlerThread;
 import android.os.SystemClock;
 import android.os.VibrationEffect;
 import android.os.Vibrator;
 import android.util.Log;
+import android.widget.Toast;
 
 import com.facebook.react.bridge.Arguments;
 import com.facebook.react.bridge.WritableMap;
@@ -1013,6 +1015,20 @@ public final class HeadTracker {
     private BufferedWriter csv; private long csvBytes = 0; private volatile boolean recording = false;
     private final StringBuilder sb = new StringBuilder(256);
     private Vibrator vibrator; private ToneGenerator tone;
+    private final Handler mainH = new Handler(Looper.getMainLooper());
+    private Toast toast;      // one reused Toast: new text replaces the old one instead of queueing
+    private long lastDiagToastMs = 0;
+
+    /** On-screen feedback so you can see what the tracker is doing (camera/face/errors). */
+    private void toast(final String s) {
+        mainH.post(() -> {
+            try {
+                if (toast == null) toast = Toast.makeText(context, s, Toast.LENGTH_SHORT);
+                else toast.setText(s);
+                toast.show();
+            } catch (Throwable ignored) {}
+        });
+    }
 
     public HeadTracker(Context context, SensorModule sensorModule, HeadConfig config) {
         this.context = context.getApplicationContext();
@@ -1033,6 +1049,7 @@ public final class HeadTracker {
         tickerThread = new HandlerThread("HeadTicker", android.os.Process.THREAD_PRIORITY_URGENT_DISPLAY);
         tickerThread.start();
         tickerHandler = new Handler(tickerThread.getLooper());
+        toast("Head tracking: starting camera...");
         camera = new HeadCamera(context, this, config);
         state = State.SEARCHING;
         camera.start();
@@ -1047,6 +1064,7 @@ public final class HeadTracker {
         if (tickerHandler != null) tickerHandler.removeCallbacksAndMessages(null);
         if (tickerThread != null) { tickerThread.quitSafely(); tickerThread = null; }
         emitSensorData(0, 0);
+        toast("Head tracking stopped");
         closeCsv();
         if (tone != null) { try { tone.release(); } catch (Throwable ignored) {} tone = null; }
     }
@@ -1095,12 +1113,13 @@ public final class HeadTracker {
 
     // ================================================================== camera callbacks
 
-    public void onCameraBound() { /* state moves on the first face result */ }
+    public void onCameraBound() { if (config.diag_overlay) toast("Head: camera running, looking for your face"); }
 
     public void onCameraError(String msg) {
         Log.e(TAG, "Camera error: " + msg);
         state = State.ERROR;
         hapticError();
+        toast("HEAD TRACKING ERROR: " + msg);
         emitStatusNow(msg);
     }
 
@@ -1273,6 +1292,7 @@ public final class HeadTracker {
             stillX.reset(); stillY.reset(); euroX.reset(); euroY.reset(); slewX.reset(); slewY.reset();
             hapticPulse();
         }
+        if (s != prevState && c.diag_overlay) toast("Head: " + s.name());
         prevState = s;
 
         if (flickResetReq) { flickResetReq = false; flickX.softReset(); flickY.softReset(); stillX.reset(); stillY.reset(); }
@@ -1354,6 +1374,12 @@ public final class HeadTracker {
 
         if (recording) writeCsv(nowMs, s, c, yawHat, pitchHat, vYaw, vPitch, ox, oy);
         if (c.diag_overlay && nowMs - lastDiagMs >= 250) { lastDiagMs = nowMs; emitStatusNow(null); }
+        if (c.diag_overlay && s == State.TRACKING && nowMs - lastDiagToastMs >= 1500) {
+            lastDiagToastMs = nowMs;
+            toast(String.format(java.util.Locale.US, "Head %s  yaw %.0f pitch %.0f  stick %d,%d  %.0ffps %dms %s",
+                    c.output_mode == 0 ? "HOLD" : "FLICK", yawHat, pitchHat, lastIx, lastIy, fps, inferMs,
+                    camera != null ? camera.getDelegateName() : "?"));
+        }
     }
 
     /** Pipeline compensation + user look-ahead (spec 8.4). hat/v are stamped at the frame time; L = frame age. */
@@ -1560,6 +1586,7 @@ SETTINGS = [
     ("head_haptics", "radio", "Head tracking vibration cues", "Vibrate when your face is found / lost, and on recentre.", ONOFF, 1),
     ("head_delegate", "radio", "Face model runs on", "Auto tries the GPU and falls back to the CPU. Try CPU if the game stutters.", [(0, "Auto"), (1, "GPU"), (2, "CPU")], 0),
     ("head_fps", "radio", "Camera frame rate", "Auto = default.", [(0, "Auto"), (30, "30"), (60, "60")], 0),
+    ("head_diag_overlay", "radio", "Head tracking status messages", "Shows camera / face / output status on screen while testing.", ONOFF, 1),
     ("head_raw_landmarks", "radio", "Raw landmarks (A/B test)", "Turns off MediaPipe's built-in smoothing. Compare feel and the CSV log.", ONOFF, 0),
 ]
 
@@ -1793,13 +1820,6 @@ MENU = [
     ("toggleGyroTilt", "Toggle gyro tilt"),
     ("recenterHead", "Re-centre head"),
     ("switchHeadCamera", "Head: switch front/rear camera"),
-    ("switchHeadMode", "Head: switch Hold/Flick"),
-    ("headSensUp", "Head: Flick sensitivity +"),
-    ("headSensDown", "Head: Flick sensitivity -"),
-    ("headInvertX", "Head: invert left/right"),
-    ("headInvertY", "Head: invert up/down"),
-    ("headPause", "Head: pause/resume"),
-    ("headRecord", "Head: record CSV log"),
 ]
 
 
