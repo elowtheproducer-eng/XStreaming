@@ -94,6 +94,195 @@ def new_file(path_str, content):
 # 1. new Java sources
 # ----------------------------------------------------------------------------------------------
 JAVA = {}
+JAVA['HeadLog'] = r'''package com.xstreaming;
+
+import android.app.Activity;
+import android.app.Application;
+import android.content.ClipData;
+import android.content.ClipboardManager;
+import android.content.Context;
+import android.content.Intent;
+import android.graphics.Color;
+import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
+import android.view.Gravity;
+import android.view.View;
+import android.view.ViewGroup;
+import android.widget.FrameLayout;
+import android.widget.TextView;
+import android.widget.Toast;
+
+import java.io.File;
+import java.io.FileWriter;
+import java.io.PrintWriter;
+import java.io.RandomAccessFile;
+import java.io.StringWriter;
+import java.text.SimpleDateFormat;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.Locale;
+import java.util.Map;
+
+/** Diagnostic log: file + on-screen LOG button (tap = copy + share, long-press = clear). */
+public final class HeadLog {
+    private static final String FILE = "headlog.txt";
+    private static final long MAX_BYTES = 300 * 1024;
+    private static final int SHARE_CHARS = 90000;
+    private static File logFile;
+    private static boolean installed = false;
+    private static final Object LOCK = new Object();
+    private static final SimpleDateFormat FMT = new SimpleDateFormat("HH:mm:ss.SSS", Locale.US);
+    private static final Map<String, Long> counters = new HashMap<>();
+    private static final Map<String, Long> lastShown = new HashMap<>();
+    private static final Handler MAIN = new Handler(Looper.getMainLooper());
+
+    private HeadLog() {}
+
+    public static void d(String tag, String msg) { add("D", tag, msg, null); }
+    public static void i(String tag, String msg) { add("I", tag, msg, null); }
+    public static void w(String tag, String msg) { add("W", tag, msg, null); }
+    public static void w(String tag, String msg, Throwable t) { add("W", tag, msg, t); }
+    public static void e(String tag, String msg) { add("E", tag, msg, null); }
+    public static void e(String tag, String msg, Throwable t) { add("E", tag, msg, t); }
+
+    public static void count(String key) {
+        synchronized (LOCK) {
+            Long v = counters.get(key);
+            counters.put(key, v == null ? 1L : v + 1);
+            if (v == null) add("I", "count", "first event: " + key, null);
+        }
+    }
+
+    private static void add(String lvl, String tag, String msg, Throwable t) {
+        String line = FMT.format(new Date()) + " " + lvl + "/" + tag + ": " + msg;
+        if (t != null) {
+            StringWriter sw = new StringWriter();
+            t.printStackTrace(new PrintWriter(sw));
+            line += "\n" + sw;
+        }
+        try {
+            if ("E".equals(lvl)) android.util.Log.e(tag, msg, t);
+            else if ("W".equals(lvl)) android.util.Log.w(tag, msg, t);
+            else android.util.Log.d(tag, msg, t);
+        } catch (Throwable ignored) {}
+        synchronized (LOCK) {
+            if (logFile == null) return;
+            try (FileWriter fw = new FileWriter(logFile, true)) {
+                fw.write(line + "\n");
+            } catch (Throwable ignored) {}
+        }
+    }
+
+    public static void install(Context ctx) {
+        synchronized (LOCK) {
+            if (installed || ctx == null) return;
+            Context app = ctx.getApplicationContext() != null ? ctx.getApplicationContext() : ctx;
+            logFile = new File(app.getFilesDir(), FILE);
+            try {
+                if (logFile.exists() && logFile.length() > MAX_BYTES) logFile.delete();
+            } catch (Throwable ignored) {}
+            installed = true;
+            if (app instanceof Application) {
+                ((Application) app).registerActivityLifecycleCallbacks(new Application.ActivityLifecycleCallbacks() {
+                    public void onActivityResumed(Activity a) { attach(a); }
+                    public void onActivityCreated(Activity a, Bundle b) {}
+                    public void onActivityStarted(Activity a) {}
+                    public void onActivityPaused(Activity a) {}
+                    public void onActivityStopped(Activity a) {}
+                    public void onActivitySaveInstanceState(Activity a, Bundle b) {}
+                    public void onActivityDestroyed(Activity a) {}
+                });
+            }
+        }
+        add("I", "HeadLog", "==== process session start ==== sdk=" + android.os.Build.VERSION.SDK_INT
+                + " device=" + android.os.Build.MANUFACTURER + " " + android.os.Build.MODEL, null);
+        final Thread.UncaughtExceptionHandler prev = Thread.getDefaultUncaughtExceptionHandler();
+        Thread.setDefaultUncaughtExceptionHandler((th, ex) -> {
+            add("E", "CRASH", "uncaught on thread " + th.getName(), ex);
+            if (prev != null) prev.uncaughtException(th, ex);
+        });
+        MAIN.postDelayed(new Runnable() {
+            public void run() {
+                synchronized (LOCK) {
+                    for (Map.Entry<String, Long> en : counters.entrySet()) {
+                        Long last = lastShown.get(en.getKey());
+                        if (last == null || !last.equals(en.getValue())) {
+                            lastShown.put(en.getKey(), en.getValue());
+                            add("I", "count", en.getKey() + " = " + en.getValue(), null);
+                        }
+                    }
+                }
+                MAIN.postDelayed(this, 2000);
+            }
+        }, 2000);
+    }
+
+    public static void attach(final Activity a) {
+        if (a == null) return;
+        a.runOnUiThread(() -> {
+            try {
+                ViewGroup root = (ViewGroup) a.getWindow().getDecorView();
+                if (root.findViewWithTag("headlog_btn") != null) return;
+                TextView b = new TextView(a);
+                b.setTag("headlog_btn");
+                b.setText("LOG");
+                b.setTextColor(Color.WHITE);
+                b.setTextSize(11f);
+                b.setPadding(24, 8, 24, 8);
+                b.setBackgroundColor(0x99AA0000);
+                b.setAlpha(0.6f);
+                FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
+                        ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+                        Gravity.TOP | Gravity.CENTER_HORIZONTAL);
+                b.setOnClickListener(v -> share(a));
+                b.setOnLongClickListener(v -> { clear(); Toast.makeText(a, "Log cleared", Toast.LENGTH_SHORT).show(); return true; });
+                root.addView(b, lp);
+                add("I", "HeadLog", "LOG button attached to " + a.getClass().getSimpleName(), null);
+            } catch (Throwable t) {
+                add("E", "HeadLog", "attach failed", t);
+            }
+        });
+    }
+
+    public static String read() {
+        synchronized (LOCK) {
+            if (logFile == null || !logFile.exists()) return "(no log)";
+            try (RandomAccessFile f = new RandomAccessFile(logFile, "r")) {
+                long len = f.length();
+                long start = Math.max(0, len - SHARE_CHARS);
+                f.seek(start);
+                byte[] buf = new byte[(int) (len - start)];
+                f.readFully(buf);
+                return new String(buf, "UTF-8");
+            } catch (Throwable t) {
+                return "(read failed: " + t + ")";
+            }
+        }
+    }
+
+    public static void clear() {
+        synchronized (LOCK) { try { if (logFile != null) logFile.delete(); } catch (Throwable ignored) {} }
+        add("I", "HeadLog", "log cleared", null);
+    }
+
+    public static void share(Activity a) {
+        try {
+            add("I", "HeadLog", "share tapped", null);
+            String text = read();
+            ClipboardManager cm = (ClipboardManager) a.getSystemService(Context.CLIPBOARD_SERVICE);
+            if (cm != null) cm.setPrimaryClip(ClipData.newPlainText("headlog", text));
+            Toast.makeText(a, "Log copied to clipboard", Toast.LENGTH_SHORT).show();
+            Intent it = new Intent(Intent.ACTION_SEND);
+            it.setType("text/plain");
+            it.putExtra(Intent.EXTRA_TEXT, text);
+            a.startActivity(Intent.createChooser(it, "Share head-tracking log"));
+        } catch (Throwable t) {
+            add("E", "HeadLog", "share failed", t);
+        }
+    }
+}
+'''
 JAVA['HeadConfig'] = r'''package com.xstreaming;
 
 import com.facebook.react.bridge.ReadableMap;
@@ -137,7 +326,7 @@ public final class HeadConfig {
     public boolean neutral_creep = true;
     public int delegate = 0;             // 0 Auto(GPU->CPU fallback), 1 GPU, 2 CPU
     public boolean multi_face = false;
-    public boolean diag_overlay = true;   // TEST BUILD: on-screen status toasts. Set 0 in settings to hide
+    public boolean diag_overlay = false;
 
     public HeadConfig copy() {
         HeadConfig c = new HeadConfig();
@@ -917,13 +1106,11 @@ import android.media.AudioManager;
 import android.media.ToneGenerator;
 import android.os.Build;
 import android.os.Handler;
-import android.os.Looper;
 import android.os.HandlerThread;
 import android.os.SystemClock;
 import android.os.VibrationEffect;
 import android.os.Vibrator;
 import android.util.Log;
-import android.widget.Toast;
 
 import com.facebook.react.bridge.Arguments;
 import com.facebook.react.bridge.WritableMap;
@@ -1015,20 +1202,6 @@ public final class HeadTracker {
     private BufferedWriter csv; private long csvBytes = 0; private volatile boolean recording = false;
     private final StringBuilder sb = new StringBuilder(256);
     private Vibrator vibrator; private ToneGenerator tone;
-    private final Handler mainH = new Handler(Looper.getMainLooper());
-    private Toast toast;      // one reused Toast: new text replaces the old one instead of queueing
-    private long lastDiagToastMs = 0;
-
-    /** On-screen feedback so you can see what the tracker is doing (camera/face/errors). */
-    private void toast(final String s) {
-        mainH.post(() -> {
-            try {
-                if (toast == null) toast = Toast.makeText(context, s, Toast.LENGTH_SHORT);
-                else toast.setText(s);
-                toast.show();
-            } catch (Throwable ignored) {}
-        });
-    }
 
     public HeadTracker(Context context, SensorModule sensorModule, HeadConfig config) {
         this.context = context.getApplicationContext();
@@ -1049,7 +1222,6 @@ public final class HeadTracker {
         tickerThread = new HandlerThread("HeadTicker", android.os.Process.THREAD_PRIORITY_URGENT_DISPLAY);
         tickerThread.start();
         tickerHandler = new Handler(tickerThread.getLooper());
-        toast("Head tracking: starting camera...");
         camera = new HeadCamera(context, this, config);
         state = State.SEARCHING;
         camera.start();
@@ -1064,7 +1236,6 @@ public final class HeadTracker {
         if (tickerHandler != null) tickerHandler.removeCallbacksAndMessages(null);
         if (tickerThread != null) { tickerThread.quitSafely(); tickerThread = null; }
         emitSensorData(0, 0);
-        toast("Head tracking stopped");
         closeCsv();
         if (tone != null) { try { tone.release(); } catch (Throwable ignored) {} tone = null; }
     }
@@ -1113,13 +1284,12 @@ public final class HeadTracker {
 
     // ================================================================== camera callbacks
 
-    public void onCameraBound() { if (config.diag_overlay) toast("Head: camera running, looking for your face"); }
+    public void onCameraBound() { /* state moves on the first face result */ }
 
     public void onCameraError(String msg) {
         Log.e(TAG, "Camera error: " + msg);
         state = State.ERROR;
         hapticError();
-        toast("HEAD TRACKING ERROR: " + msg);
         emitStatusNow(msg);
     }
 
@@ -1292,7 +1462,6 @@ public final class HeadTracker {
             stillX.reset(); stillY.reset(); euroX.reset(); euroY.reset(); slewX.reset(); slewY.reset();
             hapticPulse();
         }
-        if (s != prevState && c.diag_overlay) toast("Head: " + s.name());
         prevState = s;
 
         if (flickResetReq) { flickResetReq = false; flickX.softReset(); flickY.softReset(); stillX.reset(); stillY.reset(); }
@@ -1374,12 +1543,6 @@ public final class HeadTracker {
 
         if (recording) writeCsv(nowMs, s, c, yawHat, pitchHat, vYaw, vPitch, ox, oy);
         if (c.diag_overlay && nowMs - lastDiagMs >= 250) { lastDiagMs = nowMs; emitStatusNow(null); }
-        if (c.diag_overlay && s == State.TRACKING && nowMs - lastDiagToastMs >= 1500) {
-            lastDiagToastMs = nowMs;
-            toast(String.format(java.util.Locale.US, "Head %s  yaw %.0f pitch %.0f  stick %d,%d  %.0ffps %dms %s",
-                    c.output_mode == 0 ? "HOLD" : "FLICK", yawHat, pitchHat, lastIx, lastIy, fps, inferMs,
-                    camera != null ? camera.getDelegateName() : "?"));
-        }
     }
 
     /** Pipeline compensation + user look-ahead (spec 8.4). hat/v are stamped at the frame time; L = frame age. */
@@ -1470,6 +1633,7 @@ SENSOR_METHODS = r'''
     // HEADTRACK ---------------- camera head tracking (see HeadTracker.java) ----------------
     @ReactMethod
     public synchronized void startHeadTrack(com.facebook.react.bridge.ReadableMap cfg) {
+        HeadLog.i("SensorModule", "startHeadTrack CALLED from JS, cfg=" + cfg);
         try {
             if (headTracker == null) {
                 headTracker = new HeadTracker(getReactApplicationContext(), this, HeadConfig.fromMap(cfg));
@@ -1496,6 +1660,9 @@ SENSOR_METHODS = r'''
             headTracker = null;
         }
     }
+
+    @ReactMethod
+    public void headLog(String msg) { HeadLog.i("JS", msg); }
 
     @ReactMethod
     public void headRecenter() { if (headTracker != null) headTracker.recenter(); }
@@ -1533,7 +1700,12 @@ def patch_sensor_module():
     text = splice(text, m.end(), m.end(), "\n        if (headTracker != null) { headTracker.recenter(); }")
 
     m = one(text, r"public\s+void\s+stopSensor\s*\(\s*\)\s*\{", path, "stopSensor()", kw)
-    text = splice(text, m.end(), m.end(), "\n        stopHeadTrack();")
+    text = splice(text, m.end(), m.end(), "\n        HeadLog.w(\"SensorModule\", \"stopSensor() called -> stops head tracking\", new Throwable(\"stopSensor caller\"));\n        stopHeadTrack();")
+
+    m = one(text, r"public\s+SensorModule\s*\([^)]*\)\s*\{", path, "SensorModule constructor", kw)
+    text = splice(text, m.end(), m.end(), "\n        HeadLog.install(reactContext); HeadLog.attach(reactContext.getCurrentActivity()); HeadLog.i(\"SensorModule\", \"module constructed\");")
+    m = one(text, r"(?:public|private)\s+void\s+sendEvent\s*\([^)]*\)\s*\{", path, "sendEvent body", kw)
+    text = splice(text, m.end(), m.end(), "\n        HeadLog.count(\"sendEvent:\" + eventName + (reactContext.hasActiveReactInstance() ? \"\" : \":NO_REACT_INSTANCE\"));")
 
     # sendEvent must be callable from HeadTracker (same package): only 'private' blocks that.
     if re.search(r"\bprivate(\s+(?:static\s+)?(?:final\s+)?)void\s+sendEvent\s*\(", text):
@@ -1586,7 +1758,6 @@ SETTINGS = [
     ("head_haptics", "radio", "Head tracking vibration cues", "Vibrate when your face is found / lost, and on recentre.", ONOFF, 1),
     ("head_delegate", "radio", "Face model runs on", "Auto tries the GPU and falls back to the CPU. Try CPU if the game stutters.", [(0, "Auto"), (1, "GPU"), (2, "CPU")], 0),
     ("head_fps", "radio", "Camera frame rate", "Auto = default.", [(0, "Auto"), (30, "30"), (60, "60")], 0),
-    ("head_diag_overlay", "radio", "Head tracking status messages", "Shows camera / face / output status on screen while testing.", ONOFF, 1),
     ("head_raw_landmarks", "radio", "Raw landmarks (A/B test)", "Turns off MediaPipe's built-in smoothing. Compare feel and the CSV log.", ONOFF, 0),
 ]
 
@@ -1684,6 +1855,20 @@ JS_SETUP = r'''// HEADTRACK: remember config + helpers so the in-stream toggles 
         });
         const _g: any = globalThis as any;
         _g.__xsCfg = _c;
+        try {
+          const _rn0 = require('react-native');
+          @SM@.headLog('JS setup ran. headOn=' + headOn + ' tiltOn=' + tiltOn + ' sensor=' + @S@.sensor + ' mode=' + @S@.sensor_mode + ' sensor_type=' + @S@.sensor_type);
+          if (!_g.__xsDbgSub) {
+            _g.__xsDbgSub = _rn0.DeviceEventEmitter.addListener('SensorData', () => { _g.__xsN = (_g.__xsN || 0) + 1; });
+            _g.__xsDbgLast = 0;
+            _g.__xsDbgTimer = setInterval(() => {
+              if (_g.__xsN !== _g.__xsDbgLast) {
+                _g.__xsDbgLast = _g.__xsN;
+                @SM@.headLog('JS received SensorData events total=' + _g.__xsN);
+              }
+            }, 2000);
+          }
+        } catch (e0) {}
         _g.__xsSensor = headOn ? 'head' : tiltOn ? 'tilt' : 'other';
         _g.__xsStartTilt = () => {
           @SM@.startTilt(_c.tiltRange, _c.tiltDz, false, false);
@@ -1700,9 +1885,11 @@ JS_SETUP = r'''// HEADTRACK: remember config + helpers so the in-stream toggles 
             paused: false,
             rec: false,
           };
+          try { @SM@.headLog('JS __xsStartHead: requesting CAMERA permission'); } catch (e1) {}
           _rn.PermissionsAndroid.request(
             _rn.PermissionsAndroid.PERMISSIONS.CAMERA,
           ).then((res: string) => {
+            try { @SM@.headLog('JS camera permission result=' + res); } catch (e2) {}
             if (res === _rn.PermissionsAndroid.RESULTS.GRANTED) {
               @SM@.startHeadTrack(_hc);
             } else {
@@ -1721,6 +1908,7 @@ JS_START = r'''if (headOn) {
         try {
           (globalThis as any).__xsStartHead();
         } catch (e) {
+          try { @SM@.headLog('JS start FAILED: ' + e); } catch (e3) {}
           console.warn('Head tracking start failed', e);
         }
       } else if (tiltOn) {'''
@@ -1820,6 +2008,13 @@ MENU = [
     ("toggleGyroTilt", "Toggle gyro tilt"),
     ("recenterHead", "Re-centre head"),
     ("switchHeadCamera", "Head: switch front/rear camera"),
+    ("switchHeadMode", "Head: switch Hold/Flick"),
+    ("headSensUp", "Head: Flick sensitivity +"),
+    ("headSensDown", "Head: Flick sensitivity -"),
+    ("headInvertX", "Head: invert left/right"),
+    ("headInvertY", "Head: invert up/down"),
+    ("headPause", "Head: pause/resume"),
+    ("headRecord", "Head: record CSV log"),
 ]
 
 
@@ -1856,34 +2051,7 @@ def patch_native_stream():
     m = one(text, r"\bif\s*\(\s*tiltOn\s*\)\s*\{", path, "if (tiltOn) { ... } start block", kw)
     text = splice(text, m.start(), m.end(), JS_START.replace("@S@", sv).replace("@SM@", sm))
 
-    # 4. menu items (shown only in head mode)
-    pat = (r"(?P<indent>[ \t]*)if\s*\((?P<cond>[^\n]*?sensor_mode\s*={2,3}\s*1[^\n]*?)\)\s*\{\s*"
-           r"(?P<arr>[A-Za-z_$][\w$.]*)\.push\(\s*\{[^{}]*?id:\s*['\"]recenterTilt['\"][^{}]*\}\s*\)\s*;?\s*\}")
-    m = one(text, pat, path, "the 'recenterTilt' menu item block", kw, re.S)
-    ind, cond, arr = m.group("indent"), m.group("cond"), m.group("arr")
-    # show the head/toggle items whenever the gyro is enabled, in ANY sensor mode
-    cond2 = re.sub(r"\s*&&\s*[^&|]*sensor_mode[^&|]*", "", cond)
-    if cond2.strip() == cond.strip() or not cond2.strip():
-        cond2 = re.sub(r"(sensor_mode\s*={2,3}\s*)1", r"\g<1>2", cond)
-    uses_t = re.search(r"title:\s*t\(", m.group(0)) is not None
-    lines = ["", "%sif (%s) {  // HEADTRACK" % (ind, cond2)]
-    for mid, title in MENU:
-        ttl = ("t(%s)" % js_str(title)) if uses_t else js_str(title)
-        lines.append("%s  %s.push({" % (ind, arr))
-        lines.append("%s    id: %s," % (ind, js_str(mid)))
-        lines.append("%s    title: %s," % (ind, ttl))
-        lines.append("%s  });" % ind)
-    lines.append("%s}" % ind)
-    text = splice(text, m.end(), m.end(), "\n".join(lines))
-
-    # 5. menu actions, inserted just before the existing recenterTilt case
-    m = one(text, r"case\s+'recenterTilt'", path, "case 'recenterTilt':", kw)
-    line_start = text.rfind("\n", 0, m.start()) + 1
-    case_ind = re.match(r"[ \t]*", text[line_start:]).group(0)
-    new_cases = JS_CASES.replace("@SM@", sm)
-    # JS_CASES is written with 6-space indentation; re-indent to match the file
-    new_cases = "\n".join((case_ind + ln[6:]) if ln.startswith("      ") else ln for ln in new_cases.split("\n"))
-    text = splice(text, m.start(), m.start(), new_cases + "\n" + case_ind)
+    # (menu edits intentionally removed: they broke pause-menu scrolling)
 
     write(path, text, crlf)
     print("  patched", path, "(settings var: %s, module: %s)" % (sv, sm))
@@ -1998,7 +2166,21 @@ def main():
         die("Run this from the repo root (the folder that contains android/ and src/).")
     print("1/6 new Java classes")
     for name, src in JAVA.items():
+        if name != "HeadLog":
+            src = re.sub(r"android\.util\.Log\.(?=[dwei]\()", "HeadLog.", src)
+            src = re.sub(r"(?<![\w.])Log\.(?=[dwei]\()", "HeadLog.", src)
         new_file("%s/%s.java" % (JAVA_DIR, name), src)
+    for ext in ("java", "kt"):
+        mp = pathlib.Path(JAVA_DIR + "/MainApplication." + ext)
+        if mp.exists():
+            t = mp.read_text(encoding="utf-8")
+            if "HeadLog.install" not in t:
+                t2, n = re.subn(r"(super\.onCreate\(\)\s*;?)", r"\1\n    HeadLog.install(this)" + (";" if ext == "java" else ""), t, count=1)
+                if n:
+                    mp.write_text(t2, encoding="utf-8")
+                    print("  HeadLog installed in MainApplication." + ext)
+                else:
+                    print("  WARNING: super.onCreate() not found in MainApplication; HeadLog installs from SensorModule instead")
     print("2/6 SensorModule.java")
     patch_sensor_module()
     print("3/6 settings")
