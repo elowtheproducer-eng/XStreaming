@@ -1,7 +1,10 @@
-name: Build tilt APK
+name: Build tilt + head-tracking APK
 
 on:
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   build:
@@ -24,8 +27,30 @@ jobs:
       - name: Enable Yarn
         run: corepack enable
 
+      # ---- source patches (order matters: tilt first, head tracking second) ----
       - name: Apply tilt patch
         run: python3 .github/apply_tilt_patch.py
+
+      - name: Apply head tracking patch
+        run: python3 .github/apply_headtrack_patch.py
+
+      - name: Save a diff of everything the patches changed
+        if: always()
+        run: |
+          git add -A -N . || true
+          git diff > patches.diff || true
+          git diff --stat | tail -25 || true
+
+      # ---- MediaPipe face model, bundled into the APK (no network needed at runtime) ----
+      - name: Download face landmarker model
+        run: |
+          mkdir -p android/app/src/main/assets
+          curl -fL --retry 3 --retry-delay 2 \
+            -o android/app/src/main/assets/face_landmarker.task \
+            https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task
+          SIZE=$(stat -c%s android/app/src/main/assets/face_landmarker.task)
+          echo "face_landmarker.task = $SIZE bytes"
+          test "$SIZE" -gt 2000000
 
       - name: Install JS dependencies
         run: yarn install
@@ -55,12 +80,29 @@ jobs:
               --ks "$GITHUB_WORKSPACE/android/app/debug.keystore" \
               --ks-pass pass:android --key-pass pass:android \
               --ks-key-alias androiddebugkey \
-              --out xstreaming-tilt.apk aligned.apk
+              --out xstreaming-head.apk aligned.apk
             rm -f aligned.apk *unsigned*.apk
           fi
           ls -la
 
       - uses: actions/upload-artifact@v4
         with:
-          name: xstreaming-tilt-apk
+          name: xstreaming-head-apk
           path: android/app/build/outputs/apk/dev/release/*.apk
+
+      # ---- always keep the diff; on failure also keep the Gradle reports ----
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: patches-diff
+          path: patches.diff
+          if-no-files-found: ignore
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: gradle-reports
+          path: |
+            android/app/build/reports
+            android/build/reports
+          if-no-files-found: ignore
