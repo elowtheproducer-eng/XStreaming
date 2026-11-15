@@ -262,6 +262,11 @@ public class RadioModule extends ReactContextBaseJavaModule {
         });
     }
 
+    @ReactMethod
+    public void log(String msg) {
+        try { com.xstreaming.HeadLog.i("Radio", msg); } catch (Throwable ignored) { }
+    }
+
     // short "radio keyed" blip before a transmission
     @ReactMethod
     public void click() {
@@ -489,6 +494,7 @@ class SimRadio {
     try {
       const frame = await RadioModule.captureFrame(768, 70);
       const text = await this.ask(frame);
+      this.log('model=' + this.lastModel + ' said=' + (text || '(skip)'));
       if (text && (this.on || force)) {
         this.history.push(text);
         if (this.history.length > 8) {
@@ -498,7 +504,15 @@ class SimRadio {
           toast('📻 ' + text);
         }
         RadioModule?.click?.();
-        await RadioModule?.speak?.(text, 1.0, 0.95);
+        await Promise.race([
+          RadioModule?.speak?.(text, 1.0, 0.95),
+          new Promise(res =>
+            setTimeout(() => {
+              RadioModule?.stopSpeaking?.();
+              res(false);
+            }, 30000),
+          ),
+        ]);
       }
     } catch (e: any) {
       this.noteError(e);
@@ -508,9 +522,16 @@ class SimRadio {
     }
   }
 
+  private log(m: string) {
+    try {
+      RadioModule?.log?.(m);
+    } catch (e) {}
+  }
+
   private noteError(e: any) {
     const msg = String(e?.message || e);
     this.lastError = msg;
+    this.log('error: ' + msg);
     const now = Date.now();
     if (/NO_SURFACE|INVALID_SURFACE|NO_ACTIVITY/.test(msg)) {
       return; // stream not showing yet
@@ -546,7 +567,7 @@ class SimRadio {
     } catch (e) {}
   }
 
-  private async timedFetch(url: string, init: any, ms = 25000) {
+  private async timedFetch(url: string, init: any, ms = 15000) {
     const ctrl = new AbortController();
     const t = setTimeout(() => ctrl.abort(), ms);
     try {
@@ -671,9 +692,12 @@ class SimRadio {
           this.setCooldown(model, e);
           this.lastError = model + ': ' + e.message;
         } else {
-          // network / timeout: do not burn the chain, just try again next tick
-          throw e;
+          // timeout / network hiccup on this model: park it briefly and try the next one
+          this.cooldown[model] = Date.now() + 90 * 1000;
+          this.lastError =
+            model + ': ' + (e?.name === 'AbortError' ? 'timeout' : String(e?.message || e));
         }
+        this.log('fallback from ' + model + ' -> ' + this.lastError);
       }
     }
     if (tried.length === 0) {
@@ -713,57 +737,82 @@ class SimRadio {
     }
   }
 
-  async openSettings(
+  async openMenu(
     showOptions: (items: any[], o?: any) => Promise<any>,
     showInput: (o: any) => Promise<any>,
   ) {
-    const pid = this.getPersonaId();
-    const iv = this.getInterval();
-    const items: any[] = [
-      {id: 'radio:now', title: '📻 Talk now'},
-      {
-        id: 'radio:key',
-        title: this.getApiKey() ? 'Gemini API key: set (change)' : 'Gemini API key: NOT SET',
-      },
-      {
-        id: 'radio:captions',
-        title: 'Show captions',
-        active: this.getCaptions(),
-      },
-      {id: 'radio:status', title: 'Status / last error'},
-    ];
-    PERSONAS.forEach(p =>
-      items.push({id: 'radio:persona:' + p.id, title: 'Voice: ' + p.name, active: p.id === pid}),
-    );
-    INTERVALS.forEach(s =>
-      items.push({id: 'radio:interval:' + s, title: 'Talk every ' + s + 's', active: s === iv}),
-    );
-    const res = await showOptions(items, {});
-    if (res?.action !== 'select') {
-      return;
-    }
-    const id: string = String(res.id || '');
-    if (id === 'radio:now') {
-      if (!this.getApiKey()) {
+    const pause = () => new Promise(r => setTimeout(r, 150));
+    let screen = 'main';
+    for (let guard = 0; guard < 40; guard++) {
+      const pid = this.getPersonaId();
+      const iv = this.getInterval();
+      let items: any[] = [];
+      if (screen === 'main') {
+        const pname = (PERSONAS.find(p => p.id === pid) || PERSONAS[0]).name;
+        items = [
+          {id: 'radio:toggle', title: this.on ? 'Stop radio' : 'Start radio', active: this.on},
+          {id: 'radio:now', title: 'Talk now'},
+          {id: 'radio:voice', title: 'Voice: ' + pname},
+          {id: 'radio:interval', title: 'Talk every ' + iv + 's'},
+          {id: 'radio:key', title: this.getApiKey() ? 'API key: set' : 'API key: NOT SET'},
+          {id: 'radio:captions', title: 'Captions', active: this.getCaptions()},
+          {id: 'radio:status', title: 'Status / last error'},
+        ];
+      } else if (screen === 'voice') {
+        items = PERSONAS.map(p => ({id: 'radio:persona:' + p.id, title: p.name, active: p.id === pid}));
+        items.push({id: 'radio:back', title: 'Back'});
+      } else {
+        items = INTERVALS.map(s => ({id: 'radio:interval:' + s, title: 'Every ' + s + ' seconds', active: s === iv}));
+        items.push({id: 'radio:back', title: 'Back'});
+      }
+      const res = await showOptions(items, {});
+      if (res?.action !== 'select') {
+        return;
+      }
+      const id: string = String(res.id || '');
+      if (id === 'radio:toggle') {
+        if (this.on) {
+          this.stop();
+          toast('Sim Radio off');
+        } else {
+          if (!this.getApiKey()) {
+            await this.promptForKey(showInput);
+          }
+          if (this.getApiKey()) {
+            this.start();
+            toast('Sim Radio on');
+          }
+        }
+        return;
+      } else if (id === 'radio:now') {
+        if (!this.getApiKey()) {
+          await this.promptForKey(showInput);
+        }
+        if (this.getApiKey()) {
+          this.talkNow();
+        }
+        return;
+      } else if (id === 'radio:voice') {
+        screen = 'voice';
+      } else if (id === 'radio:interval') {
+        screen = 'interval';
+      } else if (id === 'radio:back') {
+        screen = 'main';
+      } else if (id === 'radio:key') {
         await this.promptForKey(showInput);
+      } else if (id === 'radio:captions') {
+        this.setCaptions(!this.getCaptions());
+      } else if (id === 'radio:status') {
+        ToastAndroid.show(this.statusText(), ToastAndroid.LONG);
+      } else if (id.startsWith('radio:persona:')) {
+        this.setPersonaId(id.slice('radio:persona:'.length));
+        this.history = [];
+        screen = 'main';
+      } else if (id.startsWith('radio:interval:')) {
+        this.setInterval(parseInt(id.slice('radio:interval:'.length), 10) || 30);
+        screen = 'main';
       }
-      if (this.getApiKey()) {
-        this.talkNow();
-      }
-    } else if (id === 'radio:key') {
-      await this.promptForKey(showInput);
-    } else if (id === 'radio:captions') {
-      this.setCaptions(!this.getCaptions());
-      toast('Captions ' + (this.getCaptions() ? 'on' : 'off'));
-    } else if (id === 'radio:status') {
-      ToastAndroid.show(this.statusText(), ToastAndroid.LONG);
-    } else if (id.startsWith('radio:persona:')) {
-      this.setPersonaId(id.slice('radio:persona:'.length));
-      this.history = [];
-      toast('Radio voice changed');
-    } else if (id.startsWith('radio:interval:')) {
-      this.setInterval(parseInt(id.slice('radio:interval:'.length), 10) || 30);
-      toast('Radio interval set');
+      await pause();
     }
   }
 }
@@ -776,30 +825,11 @@ export default radio;
 # NativeStream.tsx edits
 # ------------------------------------------------------------------------------------------
 CASES = r'''      // RADIO ---- Sim Radio
-      case 'radioToggle': {
-        try {
-          if (radio.isOn()) {
-            radio.stop();
-            ToastAndroid.show('Sim Radio off', ToastAndroid.SHORT);
-          } else {
-            if (!radio.getApiKey()) {
-              await radio.promptForKey(showNativeInputDialog);
-            }
-            if (radio.getApiKey()) {
-              radio.start();
-              ToastAndroid.show('Sim Radio on', ToastAndroid.SHORT);
-            }
-          }
-        } catch (err: any) {
-          ToastAndroid.show(err?.message || 'Radio error', ToastAndroid.SHORT);
-        }
-        break;
-      }
-      case 'radioSettings': {
+      case 'radioMenu': {
         try {
           GamepadManager.setCurrentScreen('');
           resumeGamepadNavigation();
-          await radio.openSettings(showNativeOptionsDialog, showNativeInputDialog);
+          await radio.openMenu(showNativeOptionsDialog, showNativeInputDialog);
         } catch (err: any) {
           ToastAndroid.show(err?.message || 'Radio error', ToastAndroid.SHORT);
         } finally {
@@ -813,13 +843,9 @@ CASES = r'''      // RADIO ---- Sim Radio
 ITEMS = r'''
       // RADIO
       items.push({
-        id: 'radioToggle',
-        title: radio.isOn() ? '📻 Stop Sim Radio' : '📻 Start Sim Radio',
+        id: 'radioMenu',
+        title: radio.isOn() ? '📻 Sim Radio (ON)' : '📻 Sim Radio',
         active: radio.isOn(),
-      });
-      items.push({
-        id: 'radioSettings',
-        title: '📻 Sim Radio settings',
       });'''
 
 
