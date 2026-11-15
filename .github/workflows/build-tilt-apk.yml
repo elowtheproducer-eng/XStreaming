@@ -1,4 +1,4 @@
-name: Build tilt + head-tracking APK
+name: Build tilt + head-tracking + Sim Radio APK
 
 on:
   workflow_dispatch:
@@ -27,12 +27,15 @@ jobs:
       - name: Enable Yarn
         run: corepack enable
 
-      # ---- source patches (order matters: tilt first, head tracking second) ----
+      # ---- source patches (order matters: tilt, head tracking, then radio) ----
       - name: Apply tilt patch
         run: python3 .github/apply_tilt_patch.py
 
       - name: Apply head tracking patch
         run: python3 .github/apply_headtrack_patch.py
+
+      - name: Apply Sim Radio patch
+        run: python3 .github/apply_radio_patch.py
 
       - name: Save a diff of everything the patches changed
         if: always()
