@@ -1,29 +1,39 @@
 #!/usr/bin/env python3
 """
-apply_radio_patch.py  -  XStreaming "Sim Radio": Gemini looks at the stream and talks about it.
+apply_brain_patch.py  -  XStreaming "Brain": permanent trip memory, backup, black OLED radio screen,
+10-second screenshot batches and sharper frames for Sim Radio.
 
-Run from the REPO ROOT, AFTER apply_tilt_patch.py and apply_headtrack_patch.py:
-    python3 .github/apply_radio_patch.py
+Run from the REPO ROOT, AFTER apply_radio_patch.py:
+    python3 .github/apply_brain_patch.py
 
 What it does
-  1. writes android/app/src/main/java/com/xstreaming/radio/RadioModule.java + RadioPackage.java
-     (frame grab via PixelCopy, Android text-to-speech, radio click)
-  2. registers RadioPackage in MainApplication.java
-  3. writes src/utils/radio.ts (Gemini engine, model fallback chain, personas, settings)
-  4. patches src/pages/NativeStream.tsx (pause-menu items "Start/Stop Sim Radio" + "Sim Radio settings")
+  1. writes src/utils/brain.ts
+       - compact permanent memory of every trip and place (stored small, rendered to the model in
+         full every turn, with per-place detail the model can ask for or that is pulled in automatically
+         when you are somewhere you have been before)
+       - backup / restore / share, and the black OLED "radio screen"
+  2. writes android/app/src/main/java/com/xstreaming/brain/BrainModule.java + BrainPackage.java
+       - backup file in Downloads/XStreamingBackup (survives an app wipe or uninstall), restore picker,
+         share sheet, and the black always-on radio-symbol overlay (hold a finger 1.5 s to go back)
+  3. registers BrainPackage in MainApplication.java
+  4. patches src/utils/radio.ts
+       - main frame 1600 px / quality 85 (was 1024 / 75), model timeout 16 s -> 25 s
+       - a small screenshot every 10 s, sent as one batch with the next prompt
+       - the model now also reports PLACES / LOG / RECALL, which feed the brain
+       - new menu entries: "Brain, logbook and backup" and "Black radio screen (OLED)"
+  5. writes docs/brain-further-plans.md
 
-Safe to re-run (RADIO marker). If an anchor is missing it STOPS and prints context: paste that log back.
+Safe to re-run (BRAIN marker). If an anchor is missing it STOPS and prints context: paste that log back.
 """
 import pathlib
 import re
 import sys
 
-MARK = "RADIO"
-JAVA_DIR = "android/app/src/main/java/com/xstreaming/radio"
+JAVA_DIR = "android/app/src/main/java/com/xstreaming/brain"
 
 
 def die(msg, path=None, text=None, keywords=()):
-    print("\n==================== RADIO PATCH FAILED ====================")
+    print("\n==================== BRAIN PATCH FAILED ====================")
     print(msg)
     if path:
         print("File:", path)
@@ -61,289 +71,391 @@ def write(p, text, crlf=False):
 # ------------------------------------------------------------------------------------------
 # Java
 # ------------------------------------------------------------------------------------------
-RADIO_MODULE = r'''package com.xstreaming.radio;
+BRAIN_MODULE = r'''package com.xstreaming.brain;
 
-// RADIO: frame grab + text-to-speech for Sim Radio
+// BRAIN: backup / restore of the trip brain (Downloads, survives uninstall) + black OLED radio screen
 
+import android.annotation.SuppressLint;
 import android.app.Activity;
-import android.graphics.Bitmap;
-import android.media.AudioAttributes;
-import android.media.AudioFormat;
-import android.media.AudioManager;
-import android.media.AudioTrack;
-import android.media.ToneGenerator;
+import android.content.ContentResolver;
+import android.content.ContentUris;
+import android.content.ContentValues;
+import android.content.Context;
+import android.content.Intent;
+import android.database.Cursor;
+import android.graphics.Canvas;
+import android.graphics.Color;
+import android.graphics.Paint;
+import android.graphics.RectF;
+import android.net.Uri;
 import android.os.Build;
+import android.os.Environment;
 import android.os.Handler;
-import android.os.HandlerThread;
 import android.os.Looper;
-import android.speech.tts.TextToSpeech;
-import android.speech.tts.UtteranceProgressListener;
-import android.util.Base64;
-import android.view.PixelCopy;
-import android.view.Surface;
-import android.view.SurfaceView;
+import android.provider.MediaStore;
+import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.WindowManager;
 
 import androidx.annotation.NonNull;
 
+import com.facebook.react.bridge.ActivityEventListener;
+import com.facebook.react.bridge.BaseActivityEventListener;
 import com.facebook.react.bridge.Promise;
 import com.facebook.react.bridge.ReactApplicationContext;
 import com.facebook.react.bridge.ReactContextBaseJavaModule;
 import com.facebook.react.bridge.ReactMethod;
 
 import java.io.ByteArrayOutputStream;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Locale;
-import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.nio.charset.StandardCharsets;
 
-public class RadioModule extends ReactContextBaseJavaModule {
-    private interface Ready { void run(boolean ok); }
+@SuppressLint("NewApi")
+public class BrainModule extends ReactContextBaseJavaModule {
+    private static final String DIR = "XStreamingBackup";
+    private static final int REQ_PICK = 7311;
+    private static final int MAX_BYTES = 20 * 1024 * 1024;
 
-    private TextToSpeech tts;
-    private boolean ttsReady = false;
-    private boolean ttsFailed = false;
-    private final List<Ready> waiting = new ArrayList<>();
-    private final Map<String, Promise> speakPromises = new ConcurrentHashMap<>();
+    private Promise pickPromise;
+    private BlackoutView overlay;
+    private boolean dimmed = false;
+    private float savedBrightness = WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE;
 
-    public RadioModule(ReactApplicationContext ctx) {
+    private final ActivityEventListener listener = new BaseActivityEventListener() {
+        @Override
+        public void onActivityResult(Activity activity, int requestCode, int resultCode, Intent data) {
+            if (requestCode != REQ_PICK) return;
+            Promise p = pickPromise;
+            pickPromise = null;
+            if (p == null) return;
+            if (resultCode != Activity.RESULT_OK || data == null || data.getData() == null) {
+                p.reject("CANCELLED", "cancelled");
+                return;
+            }
+            try (InputStream in = getReactApplicationContext().getContentResolver().openInputStream(data.getData())) {
+                p.resolve(readAll(in));
+            } catch (Throwable t) {
+                p.reject("READ_FAILED", String.valueOf(t.getMessage()));
+            }
+        }
+    };
+
+    public BrainModule(ReactApplicationContext ctx) {
         super(ctx);
+        ctx.addActivityEventListener(listener);
     }
 
     @NonNull
     @Override
     public String getName() {
-        return "RadioModule";
-    }
-
-    // ---------------------------------------------------------------- frame grab
-    @ReactMethod
-    public void captureFrame(final int maxWidth, final int quality, final Promise promise) {
-        final Activity activity = getCurrentActivity();
-        if (activity == null) {
-            promise.reject("NO_ACTIVITY", "Current activity is null");
-            return;
-        }
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
-            promise.reject("UNSUPPORTED", "PixelCopy needs Android 8+");
-            return;
-        }
-        activity.runOnUiThread(() -> {
-            try {
-                SurfaceView sv = findActiveSurfaceView(activity.getWindow().getDecorView());
-                if (sv == null) {
-                    promise.reject("NO_SURFACE", "No active video surface found");
-                    return;
-                }
-                int w = sv.getWidth();
-                int h = sv.getHeight();
-                Surface surface = sv.getHolder().getSurface();
-                if (w <= 1 || h <= 1 || surface == null || !surface.isValid()) {
-                    promise.reject("INVALID_SURFACE", "Surface not ready");
-                    return;
-                }
-                int tw = Math.min(maxWidth > 0 ? maxWidth : 768, w);
-                int th = Math.max(1, Math.round(h * (tw / (float) w)));
-                final Bitmap bmp = Bitmap.createBitmap(tw, th, Bitmap.Config.ARGB_8888);
-                final HandlerThread ht = new HandlerThread("RadioPixelCopy");
-                ht.start();
-                Handler handler = new Handler(ht.getLooper());
-                PixelCopy.request(sv, bmp, result -> {
-                    try {
-                        if (result == PixelCopy.SUCCESS) {
-                            ByteArrayOutputStream bos = new ByteArrayOutputStream();
-                            bmp.compress(Bitmap.CompressFormat.JPEG, quality > 0 ? quality : 70, bos);
-                            promise.resolve(Base64.encodeToString(bos.toByteArray(), Base64.NO_WRAP));
-                        } else {
-                            promise.reject("COPY_FAILED", "PixelCopy failed: " + result);
-                        }
-                    } catch (Throwable t) {
-                        promise.reject("ENCODE_FAILED", String.valueOf(t.getMessage()), t);
-                    } finally {
-                        bmp.recycle();
-                        ht.quitSafely();
-                    }
-                }, handler);
-            } catch (Throwable t) {
-                promise.reject("CAPTURE_ERROR", String.valueOf(t.getMessage()), t);
-            }
-        });
-    }
-
-    private SurfaceView findActiveSurfaceView(View root) {
-        List<SurfaceView> list = new ArrayList<>();
-        collect(root, list);
-        SurfaceView selected = null;
-        int maxArea = 0;
-        for (SurfaceView sv : list) {
-            if (!sv.isShown() || sv.getVisibility() != View.VISIBLE || sv.getAlpha() <= 0.1f) continue;
-            Surface s = sv.getHolder().getSurface();
-            if (s == null || !s.isValid()) continue;
-            int w = sv.getWidth();
-            int h = sv.getHeight();
-            if (w <= 1 || h <= 1) continue;
-            if (sv.getClass().getSimpleName().contains("GLSurfaceView") && sv.getAlpha() > 0.5f) return sv;
-            int area = w * h;
-            if (area > maxArea) {
-                maxArea = area;
-                selected = sv;
-            }
-        }
-        return selected;
-    }
-
-    private void collect(View v, List<SurfaceView> out) {
-        if (v == null) return;
-        if (v instanceof SurfaceView) out.add((SurfaceView) v);
-        if (v instanceof ViewGroup) {
-            ViewGroup vg = (ViewGroup) v;
-            for (int i = 0; i < vg.getChildCount(); i++) collect(vg.getChildAt(i), out);
-        }
-    }
-
-    // ---------------------------------------------------------------- text to speech
-    private void ensureTts(final Ready cb) {
-        new Handler(Looper.getMainLooper()).post(() -> {
-            synchronized (waiting) {
-                if (ttsReady) { cb.run(true); return; }
-                if (ttsFailed) { cb.run(false); return; }
-                waiting.add(cb);
-                if (tts != null) return;
-                tts = new TextToSpeech(getReactApplicationContext(), status -> {
-                    List<Ready> copy;
-                    synchronized (waiting) {
-                        if (status == TextToSpeech.SUCCESS) {
-                            try { tts.setLanguage(Locale.getDefault()); } catch (Throwable ignored) { }
-                            tts.setOnUtteranceProgressListener(new UtteranceProgressListener() {
-                                @Override public void onStart(String id) { }
-                                @Override public void onDone(String id) { finish(id, true); }
-                                @Override public void onError(String id) { finish(id, false); }
-                                @Override public void onStop(String id, boolean interrupted) { finish(id, false); }
-                            });
-                            ttsReady = true;
-                        } else {
-                            ttsFailed = true;
-                        }
-                        copy = new ArrayList<>(waiting);
-                        waiting.clear();
-                    }
-                    for (Ready r : copy) r.run(ttsReady);
-                });
-            }
-        });
-    }
-
-    private void finish(String id, boolean ok) {
-        Promise p = speakPromises.remove(id);
-        if (p != null) p.resolve(ok);
-    }
-
-    @ReactMethod
-    public void speak(final String text, final double rate, final double pitch, final Promise promise) {
-        ensureTts(ok -> {
-            if (!ok || text == null || text.trim().isEmpty()) { promise.resolve(false); return; }
-            String t = text.length() > 800 ? text.substring(0, 800) : text;
-            String id = "radio_" + System.nanoTime();
-            speakPromises.put(id, promise);
-            try {
-                tts.setSpeechRate((float) (rate > 0 ? rate : 1.0));
-                tts.setPitch((float) (pitch > 0 ? pitch : 1.0));
-                int r = tts.speak(t, TextToSpeech.QUEUE_FLUSH, null, id);
-                if (r != TextToSpeech.SUCCESS) finish(id, false);
-            } catch (Throwable e) {
-                finish(id, false);
-            }
-        });
-    }
-
-    private volatile AudioTrack currentTrack;
-
-    // plays raw 16-bit mono PCM (Gemini voice), resolves true when finished
-    @ReactMethod
-    public void playPcm(final String b64, final int sampleRate, final Promise promise) {
-        new Thread(() -> {
-            AudioTrack track = null;
-            try {
-                byte[] data = Base64.decode(b64, Base64.DEFAULT);
-                int off = 0;
-                if (data.length > 44 && data[0] == 'R' && data[1] == 'I' && data[2] == 'F' && data[3] == 'F') off = 44;
-                int len = data.length - off;
-                if (len < 2) { promise.resolve(false); return; }
-                int rate = sampleRate > 0 ? sampleRate : 24000;
-                int frames = len / 2;
-                track = new AudioTrack.Builder()
-                        .setAudioAttributes(new AudioAttributes.Builder()
-                                .setUsage(AudioAttributes.USAGE_MEDIA)
-                                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                                .build())
-                        .setAudioFormat(new AudioFormat.Builder()
-                                .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                                .setSampleRate(rate)
-                                .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
-                                .build())
-                        .setBufferSizeInBytes(len)
-                        .setTransferMode(AudioTrack.MODE_STATIC)
-                        .build();
-                track.write(data, off, len);
-                currentTrack = track;
-                track.play();
-                long deadline = System.currentTimeMillis() + (frames * 1000L / rate) + 3000;
-                while (System.currentTimeMillis() < deadline && currentTrack == track
-                        && track.getPlayState() == AudioTrack.PLAYSTATE_PLAYING
-                        && track.getPlaybackHeadPosition() < frames - 200) {
-                    Thread.sleep(40);
-                }
-                Thread.sleep(150);
-                promise.resolve(true);
-            } catch (Throwable t) {
-                promise.resolve(false);
-            } finally {
-                try { if (track != null) { track.stop(); track.release(); } } catch (Throwable ignored) { }
-                if (currentTrack == track) currentTrack = null;
-            }
-        }, "RadioPcm").start();
-    }
-
-    @ReactMethod
-    public void stopSpeaking() {
-        try {
-            AudioTrack t = currentTrack;
-            currentTrack = null;
-            if (t != null) t.stop();
-        } catch (Throwable ignored) { }
-        new Handler(Looper.getMainLooper()).post(() -> {
-            try { if (tts != null && ttsReady) tts.stop(); } catch (Throwable ignored) { }
-        });
-    }
-
-    @ReactMethod
-    public void log(String msg) {
-        try { com.xstreaming.HeadLog.i("Radio", msg); } catch (Throwable ignored) { }
-    }
-
-    // short "radio keyed" blip before a transmission
-    @ReactMethod
-    public void click() {
-        try {
-            final ToneGenerator tg = new ToneGenerator(AudioManager.STREAM_MUSIC, 30);
-            tg.startTone(ToneGenerator.TONE_PROP_BEEP2, 90);
-            new Handler(Looper.getMainLooper()).postDelayed(tg::release, 400);
-        } catch (Throwable ignored) { }
+        return "BrainModule";
     }
 
     @Override
     public void invalidate() {
         super.invalidate();
-        try { if (tts != null) { tts.stop(); tts.shutdown(); } } catch (Throwable ignored) { }
-        tts = null;
-        ttsReady = false;
+        try { getReactApplicationContext().removeActivityEventListener(listener); } catch (Throwable ignored) { }
+    }
+
+    // ---------------------------------------------------------------- helpers
+    private static String readAll(InputStream in) throws IOException {
+        if (in == null) throw new IOException("could not open file");
+        ByteArrayOutputStream bos = new ByteArrayOutputStream();
+        byte[] buf = new byte[8192];
+        int n;
+        while ((n = in.read(buf)) > 0) {
+            bos.write(buf, 0, n);
+            if (bos.size() > MAX_BYTES) throw new IOException("file too large");
+        }
+        return new String(bos.toByteArray(), StandardCharsets.UTF_8);
+    }
+
+    private Uri findDownload(ContentResolver cr, String name) {
+        Uri coll = MediaStore.Downloads.EXTERNAL_CONTENT_URI;
+        String[] proj = {MediaStore.MediaColumns._ID};
+        String sel = MediaStore.MediaColumns.DISPLAY_NAME + "=? AND " + MediaStore.MediaColumns.RELATIVE_PATH + " LIKE ?";
+        try (Cursor c = cr.query(coll, proj, sel, new String[]{name, Environment.DIRECTORY_DOWNLOADS + "/" + DIR + "%"}, null)) {
+            if (c != null && c.moveToFirst()) {
+                return ContentUris.withAppendedId(coll, c.getLong(0));
+            }
+        } catch (Throwable ignored) { }
+        return null;
+    }
+
+    private Uri writeToDownloads(String name, String text) throws Exception {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            throw new Exception("Backups need Android 10 or newer");
+        }
+        ContentResolver cr = getReactApplicationContext().getContentResolver();
+        byte[] bytes = text.getBytes(StandardCharsets.UTF_8);
+        Uri existing = findDownload(cr, name);
+        if (existing != null) {
+            try (OutputStream os = cr.openOutputStream(existing, "wt")) {
+                if (os == null) throw new IOException("no stream");
+                os.write(bytes);
+                return existing;
+            } catch (Exception ignored) {
+                // file belongs to an older install: fall through and create a fresh copy
+            }
+        }
+        ContentValues v = new ContentValues();
+        v.put(MediaStore.MediaColumns.DISPLAY_NAME, name);
+        v.put(MediaStore.MediaColumns.MIME_TYPE, "application/json");
+        v.put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/" + DIR);
+        Uri created = cr.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, v);
+        if (created == null) throw new IOException("could not create the backup file");
+        try (OutputStream os = cr.openOutputStream(created, "wt")) {
+            if (os == null) throw new IOException("no stream");
+            os.write(bytes);
+        }
+        return created;
+    }
+
+    // ---------------------------------------------------------------- backup / restore / share
+    @ReactMethod
+    public void writeBackup(final String json, final String name, final Promise promise) {
+        new Thread(() -> {
+            try {
+                writeToDownloads(name, json);
+                promise.resolve("Downloads/" + DIR + "/" + name);
+            } catch (Throwable t) {
+                promise.reject("WRITE_FAILED", String.valueOf(t.getMessage()), t);
+            }
+        }, "BrainBackup").start();
+    }
+
+    // silent attempt to read the latest backup (works when this install can still see the old file)
+    @ReactMethod
+    public void readLatestBackup(final String name, final Promise promise) {
+        new Thread(() -> {
+            try {
+                if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) { promise.resolve(null); return; }
+                ContentResolver cr = getReactApplicationContext().getContentResolver();
+                Uri uri = findDownload(cr, name);
+                if (uri == null) { promise.resolve(null); return; }
+                try (InputStream in = cr.openInputStream(uri)) {
+                    promise.resolve(readAll(in));
+                }
+            } catch (Throwable t) {
+                promise.resolve(null);
+            }
+        }, "BrainRead").start();
+    }
+
+    // file picker: always works, even after a reinstall
+    @ReactMethod
+    public void pickBackup(final Promise promise) {
+        final Activity a = getCurrentActivity();
+        if (a == null) { promise.reject("NO_ACTIVITY", "No activity"); return; }
+        if (pickPromise != null) { promise.reject("BUSY", "Already picking a file"); return; }
+        pickPromise = promise;
+        try {
+            Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+            i.addCategory(Intent.CATEGORY_OPENABLE);
+            i.setType("*/*");
+            a.startActivityForResult(i, REQ_PICK);
+        } catch (Throwable t) {
+            pickPromise = null;
+            promise.reject("PICK_FAILED", String.valueOf(t.getMessage()));
+        }
+    }
+
+    @ReactMethod
+    public void shareBackup(final String json, final String name, final Promise promise) {
+        new Thread(() -> {
+            try {
+                final Uri uri = writeToDownloads(name, json);
+                final Activity a = getCurrentActivity();
+                if (a == null) { promise.reject("NO_ACTIVITY", "No activity"); return; }
+                a.runOnUiThread(() -> {
+                    try {
+                        Intent send = new Intent(Intent.ACTION_SEND);
+                        send.setType("application/json");
+                        send.putExtra(Intent.EXTRA_STREAM, uri);
+                        send.putExtra(Intent.EXTRA_SUBJECT, "XStreaming brain backup");
+                        send.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                        a.startActivity(Intent.createChooser(send, "Share backup"));
+                        promise.resolve(true);
+                    } catch (Throwable t) {
+                        promise.reject("SHARE_FAILED", String.valueOf(t.getMessage()));
+                    }
+                });
+            } catch (Throwable t) {
+                promise.reject("WRITE_FAILED", String.valueOf(t.getMessage()), t);
+            }
+        }, "BrainShare").start();
+    }
+
+    // ---------------------------------------------------------------- black OLED radio screen
+    @ReactMethod
+    public void showBlackout(final boolean dim, final Promise promise) {
+        final Activity a = getCurrentActivity();
+        if (a == null) { promise.reject("NO_ACTIVITY", "No activity"); return; }
+        a.runOnUiThread(() -> {
+            try {
+                if (overlay != null) { promise.resolve(true); return; }
+                ViewGroup decor = (ViewGroup) a.getWindow().getDecorView();
+                overlay = new BlackoutView(a, () -> removeOverlay(a));
+                decor.addView(overlay, new ViewGroup.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+                if (dim) {
+                    WindowManager.LayoutParams lp = a.getWindow().getAttributes();
+                    savedBrightness = lp.screenBrightness;
+                    lp.screenBrightness = 0.01f;
+                    a.getWindow().setAttributes(lp);
+                    dimmed = true;
+                }
+                promise.resolve(true);
+            } catch (Throwable t) {
+                promise.reject("BLACKOUT_FAILED", String.valueOf(t.getMessage()), t);
+            }
+        });
+    }
+
+    // must run on the UI thread
+    private void removeOverlay(Activity a) {
+        try {
+            if (overlay != null) {
+                overlay.stop();
+                ViewGroup p = (ViewGroup) overlay.getParent();
+                if (p != null) p.removeView(overlay);
+                overlay = null;
+                if (dimmed) {
+                    WindowManager.LayoutParams lp = a.getWindow().getAttributes();
+                    lp.screenBrightness = savedBrightness;
+                    a.getWindow().setAttributes(lp);
+                    dimmed = false;
+                }
+            }
+        } catch (Throwable ignored) { }
+    }
+
+    @ReactMethod
+    public void hideBlackout() {
+        final Activity a = getCurrentActivity();
+        if (a == null) return;
+        a.runOnUiThread(() -> removeOverlay(a));
+    }
+
+    // pure black (OLED pixels off) with a dim radio symbol that drifts a few pixels every 45 s
+    private static class BlackoutView extends View {
+        private final Paint line = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint dot = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint hint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final RectF rect = new RectF();
+        private final Handler h = new Handler(Looper.getMainLooper());
+        private Runnable exit;
+        private float d;
+        private int step = 0;
+        private float sx = 0;
+        private float sy = 0;
+        private long hintUntil;
+        private boolean stopped = false;
+
+        private final Runnable redraw = new Runnable() {
+            @Override public void run() { invalidate(); }
+        };
+        private final Runnable holdExit = new Runnable() {
+            @Override public void run() { if (!stopped) exit.run(); }
+        };
+        private final Runnable shifter = new Runnable() {
+            @Override public void run() {
+                if (stopped) return;
+                final int[][] pts = {{0, 0}, {16, 10}, {-16, 14}, {12, -16}, {-14, -10}};
+                step++;
+                int[] p = pts[step % pts.length];
+                sx = p[0] * d;
+                sy = p[1] * d;
+                invalidate();
+                h.postDelayed(this, 45000);
+            }
+        };
+
+        BlackoutView(Context c, Runnable exit) {
+            super(c);
+            this.exit = exit;
+            this.d = c.getResources().getDisplayMetrics().density;
+            setBackgroundColor(Color.BLACK);
+            setClickable(true);
+            setFocusable(false);
+            setKeepScreenOn(true);
+            line.setStyle(Paint.Style.STROKE);
+            line.setStrokeWidth(2.5f * d);
+            line.setStrokeCap(Paint.Cap.ROUND);
+            line.setColor(0xFF3A3A3A);
+            dot.setStyle(Paint.Style.FILL);
+            dot.setColor(0xFF3A3A3A);
+            hint.setColor(0xFF303030);
+            hint.setTextSize(14 * d);
+            hint.setTextAlign(Paint.Align.CENTER);
+            hintUntil = System.currentTimeMillis() + 6000;
+            h.postDelayed(shifter, 45000);
+            h.postDelayed(redraw, 6100);
+        }
+
+        void stop() {
+            stopped = true;
+            h.removeCallbacksAndMessages(null);
+        }
+
+        @Override
+        public boolean onTouchEvent(MotionEvent e) {
+            switch (e.getActionMasked()) {
+                case MotionEvent.ACTION_DOWN:
+                    hintUntil = System.currentTimeMillis() + 3000;
+                    invalidate();
+                    h.postDelayed(holdExit, 1500);
+                    h.postDelayed(redraw, 3100);
+                    break;
+                case MotionEvent.ACTION_UP:
+                case MotionEvent.ACTION_CANCEL:
+                    h.removeCallbacks(holdExit);
+                    break;
+                default:
+                    break;
+            }
+            return true;
+        }
+
+        @Override
+        protected void onDraw(Canvas c) {
+            c.drawColor(Color.BLACK);
+            float u = d;
+            float cx = getWidth() / 2f + sx;
+            float cy = getHeight() / 2f + sy;
+            // radio body
+            rect.set(cx - 80 * u, cy - 45 * u, cx + 80 * u, cy + 50 * u);
+            c.drawRoundRect(rect, 14 * u, 14 * u, line);
+            // antenna and signal arcs
+            float ax = cx + 92 * u;
+            float ay = cy - 105 * u;
+            c.drawLine(cx + 52 * u, cy - 45 * u, ax, ay, line);
+            c.drawCircle(ax, ay, 3.5f * u, dot);
+            rect.set(ax - 14 * u, ay - 14 * u, ax + 14 * u, ay + 14 * u);
+            c.drawArc(rect, -80, 70, false, line);
+            rect.set(ax - 26 * u, ay - 26 * u, ax + 26 * u, ay + 26 * u);
+            c.drawArc(rect, -80, 70, false, line);
+            // speaker
+            c.drawCircle(cx - 38 * u, cy + 5 * u, 28 * u, line);
+            c.drawCircle(cx - 38 * u, cy + 5 * u, 15 * u, line);
+            c.drawCircle(cx - 38 * u, cy + 5 * u, 4 * u, dot);
+            // frequency display and tuning dial
+            rect.set(cx + 8 * u, cy - 33 * u, cx + 66 * u, cy - 15 * u);
+            c.drawRoundRect(rect, 4 * u, 4 * u, line);
+            c.drawCircle(cx + 37 * u, cy + 20 * u, 14 * u, line);
+            c.drawLine(cx + 37 * u, cy + 20 * u, cx + 44 * u, cy + 12 * u, line);
+            if (System.currentTimeMillis() < hintUntil) {
+                c.drawText("hold to return", getWidth() / 2f, getHeight() - 48 * u, hint);
+            }
+        }
     }
 }
 '''
 
-RADIO_PACKAGE = r'''package com.xstreaming.radio;
+BRAIN_PACKAGE = r'''package com.xstreaming.brain;
 
 import androidx.annotation.NonNull;
 
@@ -356,12 +468,12 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 
-public class RadioPackage implements ReactPackage {
+public class BrainPackage implements ReactPackage {
     @NonNull
     @Override
     public List<NativeModule> createNativeModules(@NonNull ReactApplicationContext ctx) {
         List<NativeModule> m = new ArrayList<>();
-        m.add(new RadioModule(ctx));
+        m.add(new BrainModule(ctx));
         return m;
     }
 
@@ -374,152 +486,61 @@ public class RadioPackage implements ReactPackage {
 '''
 
 # ------------------------------------------------------------------------------------------
-# TypeScript engine
+# TypeScript: the brain
 # ------------------------------------------------------------------------------------------
-RADIO_TS = r'''// RADIO: Sim Radio engine. Watches the stream with Gemini, keeps a running trip notebook, and talks.
+BRAIN_TS = r'''// BRAIN: permanent trip memory, backup / restore and the black OLED radio screen.
+//
+// Storage is deliberately tiny: short keys, places referenced by key, one MMKV string for the core
+// and one for the per-place detail ("dossiers"). Everything is kept forever, but what the model reads
+// every turn is rendered to a fixed budget (about 6500 characters), so the whole brain is always read
+// in one go. Per-place detail is pulled in only when the model asks for it (RECALL) or when you are at
+// a place you have visited before.
 import {NativeModules, ToastAndroid} from 'react-native';
 import {storage} from '../store/mmkv';
 
-const {RadioModule} = NativeModules;
+const {BrainModule} = NativeModules;
 
-// Vision/brain models, best -> worst (free-tier ones only; Argon/Carbon are paid). Unavailable / capped / timing out => next one.
-export const MODEL_CHAIN = [
-  'gemini-4-hydrogen',
-  'gemini-3.5-flash-lite',
-  'gemini-flash-latest',
-  'gemini-flash-lite-latest',
-  'gemini-3.1-flash-lite',
-  'gemini-2.5-flash',
-  'gemini-2.5-flash-lite',
-];
+const K_CORE = 'brain_core_v1';
+const K_DOS = 'brain_dossier_v1';
+const K_LAST_BACKUP = 'brain_last_backup';
 
-// Natural-voice (speech) models, best -> worst. If all fail the phone's own voice is used.
-export const TTS_CHAIN = [
-  'gemini-3.8-flash-tts',
-  'gemini-3.1-flash-tts-preview',
-  'gemini-2.5-flash-preview-tts',
-];
+const BACKUP_LATEST = 'xstreaming-brain-latest.json';
+const TRIP_GAP_S = 4 * 3600; // longer than this between transmissions = a new trip
+const AUTO_BACKUP_S = 600; // silent auto-backup at most every 10 minutes
+const BUDGET_PLACES = 3600; // characters of PLACES shown to the model each turn
+const BUDGET_TRIPS = 2200; // characters of TRIPS shown to the model each turn
+const MAX_FACTS = 40; // detail lines kept per place
+const MAX_ROUTE = 80; // places remembered per trip
 
-export const SPEAKERS: Array<{id: string; name: string}> = [
-  {id: 'Charon', name: 'Charon (deep, informative)'},
-  {id: 'Fenrir', name: 'Fenrir (excitable)'},
-  {id: 'Orus', name: 'Orus (firm)'},
-  {id: 'Puck', name: 'Puck (upbeat)'},
-  {id: 'Kore', name: 'Kore (firm, female)'},
-  {id: 'Aoede', name: 'Aoede (breezy, female)'},
-  {id: 'Zephyr', name: 'Zephyr (bright, female)'},
-  {id: 'Algenib', name: 'Algenib (gravelly)'},
-  {id: 'Phone voice', name: 'Phone voice (offline)'},
-];
+// settings that travel with the backup (the API key deliberately does not)
+const SETTING_STR = ['radio_persona', 'radio_speaker', 'radio_trip', 'radio_notebook', 'radio_aircraft'];
+const SETTING_NUM = ['radio_gap_min', 'radio_gap_max', 'radio_nerd'];
+const SETTING_BOOL = ['radio_captions'];
 
-const API = 'https://generativelanguage.googleapis.com/v1beta';
-const K_API = 'radio_api_key';
-const K_PERSONA = 'radio_persona';
-const K_GAP_MIN = 'radio_gap_min';
-const K_GAP_MAX = 'radio_gap_max';
-const K_CAPTIONS = 'radio_captions';
-const K_SPEAKER = 'radio_speaker';
-const K_TRIP = 'radio_trip';
-const K_NOTES = 'radio_notebook';
-const K_NERD = 'radio_nerd';
-const K_AIRCRAFT = 'radio_aircraft';
-
-export const PERSONAS: Array<{id: string; name: string; prompt: string; style: string}> = [
-  {
-    id: 'bush',
-    name: 'Bush Radio host',
-    style:
-      'Speak like a warm, slightly gravelly, relaxed late-night radio host with dry humour, natural pacing and small pauses',
-    prompt:
-      'You are the host of "Bush Radio", a late-night station for a pilot flying around the world. You are warm, dry-witted, curious and a little cheeky, and you love local stories, geography, wildlife and aviation history. You are talking to ONE listener, the pilot, like an old friend.',
-  },
-  {
-    id: 'storyteller',
-    name: 'Old bush pilot',
-    style: 'Speak like a weathered old bush pilot telling stories, unhurried, gravelly and amused',
-    prompt:
-      'You are an old, retired bush pilot riding along on the radio, full of true stories, hard-won flying wisdom and opinions about every airstrip and landscape. Tie what you see to real aviation history, real regions and real flying lessons. Facts must be correct; the telling can be colourful.',
-  },
-  {
-    id: 'guide',
-    name: 'Tour guide',
-    style: 'Speak like an enthusiastic, friendly tour guide, clear and bright',
-    prompt:
-      'You are an enthusiastic expert tour guide narrating the flight. Name landmarks, rivers, towns, mountains and what makes them interesting, with one surprising fact at a time.',
-  },
-  {
-    id: 'doc',
-    name: 'Nature documentary',
-    style: 'Speak in a calm, hushed, reverent nature-documentary narrator voice',
-    prompt:
-      'You are a calm, hushed nature-documentary narrator. Describe the land, wildlife, climate and human history below as if it were a documentary, with poetic but concrete detail.',
-  },
-  {
-    id: 'sports',
-    name: 'Race commentator',
-    style: 'Speak like an excited motorsport commentator, fast and punchy',
-    prompt:
-      'You are an excitable motorsport commentator. React to the action: speed, position, corners, close calls, crashes, the road or track and the location. Short punchy energy.',
-  },
-  {
-    id: 'copilot',
-    name: 'Sarcastic co-pilot',
-    style: 'Speak like a dry, sarcastic but affectionate co-pilot, deadpan',
-    prompt:
-      'You are a sarcastic but loyal co-pilot sitting next to the pilot. You notice real details of where we are and what is happening, and make dry funny remarks, never mean.',
-  },
-  {
-    id: 'atc',
-    name: 'ATC / traffic',
-    style: 'Speak like a calm professional air-traffic controller with a friendly edge',
-    prompt:
-      'You are a friendly air-traffic and traffic-information voice. Give professional-sounding calls about terrain ahead, airfields, weather and obstacles, with the odd advisory about what is coming up on the route.',
-  },
-];
-
-const SEGMENTS: Array<{t: string; nerd: boolean}> = [
-  {t: 'name the exact landmark, town, river, mountain or airfield below or ahead and give ONE surprising fact about it', nerd: false},
-  {t: 'tell a short true piece of local history or a human story tied to this area', nerd: false},
-  {t: 'colour about the wildlife, terrain, climate or weather typical of this exact region and altitude', nerd: false},
-  {t: 'react to the latest ATC subtitle or what the pilot is doing right now, with personality', nerd: false},
-  {t: 'trip progress: where we came from, where we are heading, what comes next on the route', nerd: false},
-  {t: 'a quick funny observation or bit of banter based on something visible on screen', nerd: false},
-  {t: 'tell the listener what to look out for in the next few minutes of flight', nerd: false},
-  {t: 'a short legend or story connected to a place we have just passed', nerd: false},
-  {t: 'recommend ONE real song (title and artist, never quote lyrics) that suits this place, this time of day or this mood of flying, and say why in a sentence or two', nerd: false},
-  {t: 'a nerdy aside about how THIS aircraft works or flies (aerodynamics, lift, engine, instruments, handling quirks of its actual type) explained so it is genuinely fun', nerd: true},
-  {t: 'a nerdy geography, geology, map or place-name fact about this region (why it looks like this, how it formed, why it is called that)', nerd: true},
-  {t: 'a bit of aviation, space or engineering history that connects to somewhere near this route', nerd: true},
-  {t: 'a fun "did you know" or a tiny trivia question to the pilot that you then answer yourself after a beat', nerd: true},
-  {t: 'chat the way real radio hosts do: a light opinion, a "what would you do" question to the pilot, or a thought about flying at this time of day', nerd: false},
-  {t: 'a nerdy tangent from physics, astronomy, language or technology that this view reminds you of', nerd: true},
-];
-
-const NERD_LEVELS: Array<{id: number; name: string; weight: number; directive: string}> = [
-  {id: 1, name: '1 - Casual (stories, banter, no science)', weight: 0,
-    directive: 'Keep it light and plain: stories, places, people, banter and music. No technical explanations or jargon at all.'},
-  {id: 2, name: '2 - A little nerdy', weight: 0.35,
-    directive: 'Mostly everyday talk. Now and then one simple, friendly science or tech fact, explained in a sentence.'},
-  {id: 3, name: '3 - Nerdy (default)', weight: 1,
-    directive: 'Nerdy but friendly: enjoy explaining how things work, with one clear, surprising fact at a time and a short "here is why".'},
-  {id: 4, name: '4 - Properly nerdy', weight: 2,
-    directive: 'Properly nerdy: go a layer deeper than most people would. Name the mechanism or effect, give real numbers, and add the history of the idea, always explained clearly so a curious person follows it.'},
-  {id: 5, name: '5 - Full professor', weight: 3.5,
-    directive: 'Full nerd: expert-level tangents, precise terminology (defined in passing), real figures, and surprising connections between fields. The listener loves rabbit holes. Still talk like a person on the radio, never like a lecture.'},
-];
-
-const GAP_MINS = [2, 4, 8, 15, 30];
-const GAP_MAXS = [15, 30, 60, 120, 240];
-
-class ApiError extends Error {
-  status: number;
-  body: string;
-  constructor(status: number, body: string) {
-    super('HTTP ' + status + ' ' + body.slice(0, 160));
-    this.status = status;
-    this.body = body;
-  }
-}
+type Place = {
+  k: string; // key (ICAO code in lower case, or the normalised name)
+  n: string; // display name
+  r: string; // country / region
+  v: number; // number of trips it appeared in
+  f: number; // first seen (epoch seconds)
+  l: number; // start of the latest trip that included it
+  o?: number; // start of the trip before that
+  t: string; // short lasting facts
+  x: Record<string, number>; // flown together with: place key -> times
+  c?: string; // ICAO code
+};
+type Trip = {
+  s: number; // start (epoch seconds), also the trip identity
+  e: number; // last activity
+  a: string; // aircraft
+  b: string; // brief
+  p: string[]; // route: place keys in order of first appearance
+  m: string; // running summary
+  z?: number; // 1 = closed
+};
+type Core = {v: number; places: Record<string, Place>; trips: Trip[]};
+type Dossiers = Record<string, string[]>;
+type Parsed = {places?: string; log?: string; recall?: string};
 
 const toast = (msg: string, long = false) => {
   try {
@@ -527,866 +548,1005 @@ const toast = (msg: string, long = false) => {
   } catch (e) {}
 };
 
-class SimRadio {
-  private on = false;
-  private busy = false;
-  private timer: any = null;
-  private history: string[] = [];
-  private cooldown: Record<string, number> = {};
-  private available: string[] | null = null;
-  private availableAt = 0;
-  private lastModel = '';
-  private lastVoice = '';
+const now = () => Math.floor(Date.now() / 1000);
+const iso = (t: number) => new Date(t * 1000).toISOString().slice(0, 10);
+const clip = (s: string, n: number) => {
+  const x = String(s || '').trim();
+  return x.length > n ? x.slice(0, n) : x;
+};
+
+const norm = (s: string) => {
+  let x = String(s || '').toLowerCase();
+  try {
+    x = x.normalize('NFD').replace(/[̀-ͯ]/g, '');
+  } catch (e) {}
+  return x
+    .replace(/\b(international|intl|airport|airfield|airstrip|aerodrome|municipal|regional|the)\b/g, ' ')
+    .replace(/[^a-z0-9]+/g, '');
+};
+
+const addTag = (old: string, tag: string) => {
+  const t = clip(tag, 60);
+  if (!t) {
+    return old;
+  }
+  if ((old || '').toLowerCase().indexOf(t.toLowerCase()) >= 0) {
+    return old;
+  }
+  let s = old ? old + '; ' + t : t;
+  while (s.length > 90 && s.indexOf('; ') > 0) {
+    s = s.slice(s.indexOf('; ') + 2);
+  }
+  return clip(s, 90);
+};
+
+const addSummary = (old: string, log: string) => {
+  if (!log || (old || '').toLowerCase().indexOf(log.toLowerCase()) >= 0) {
+    return old;
+  }
+  let s = old ? old + '; ' + log : log;
+  while (s.length > 240 && s.indexOf('; ') > 0) {
+    s = s.slice(s.indexOf('; ') + 2);
+  }
+  return s.length > 240 ? s.slice(s.length - 240) : s;
+};
+
+const noneToEmpty = (s?: string) => {
+  const x = String(s || '').trim();
+  return /^none\b/i.test(x) ? '' : x;
+};
+
+const splitList = (s?: string) =>
+  noneToEmpty(s)
+    .split(/\s*;\s*|\n/)
+    .map(x => x.trim())
+    .filter(x => x && !/^none$/i.test(x));
+
+const parsePlaces = (s?: string) => {
+  const out: Array<{name: string; code: string; region: string; tag: string}> = [];
+  for (const part of splitList(s)) {
+    const bits = part.split('|').map(x => x.trim());
+    let raw = bits[0] || '';
+    let code = '';
+    const m = raw.match(/\(([A-Z]{4})\)/);
+    if (m) {
+      code = m[1];
+      raw = raw.replace(m[0], '').trim();
+    }
+    if (!raw && !code) {
+      continue;
+    }
+    out.push({name: raw || code, code, region: bits[1] || '', tag: bits[2] || ''});
+  }
+  return out.slice(0, 4);
+};
+
+class Brain {
+  private core: Core | null = null;
+  private dos: Dossiers | null = null;
+  private recall: string[] = [];
+  private cache = '';
+  private dirty = true;
+  private lastBackupTry = 0;
   private lastError = '';
-  private lastErrorToastAt = 0;
-  private prevFrame = '';
-  private prevFrameAt = 0;
-  private lastSegment = -1;
-  private startedAt = 0;
-  private run = 0;
-  private latencyEma = 9000;
-  private thinkMode: Record<string, number> = {};
-  private pauseRatio = 0.4;
+  private warned = false;
+  private restoring = false;
 
-  // ---------- settings ----------
-  getApiKey(): string {
-    return storage.getString(K_API) || '';
-  }
-  setApiKey(k: string) {
-    storage.set(K_API, (k || '').trim());
-  }
-  getPersonaId(): string {
-    return storage.getString(K_PERSONA) || 'bush';
-  }
-  setPersonaId(id: string) {
-    storage.set(K_PERSONA, id);
-  }
-  getGapMin(): number {
-    return storage.getNumber(K_GAP_MIN) || 4;
-  }
-  getGapMax(): number {
-    return Math.max(storage.getNumber(K_GAP_MAX) || 40, this.getGapMin());
-  }
-  setGapMin(s: number) {
-    storage.set(K_GAP_MIN, s);
-  }
-  setGapMax(s: number) {
-    storage.set(K_GAP_MAX, s);
-  }
-  getCaptions(): boolean {
-    const v = storage.getBoolean(K_CAPTIONS);
-    return v === undefined ? true : v;
-  }
-  setCaptions(v: boolean) {
-    storage.set(K_CAPTIONS, v);
-  }
-  getSpeaker(): string {
-    return storage.getString(K_SPEAKER) || 'Charon';
-  }
-  setSpeaker(s: string) {
-    storage.set(K_SPEAKER, s);
-  }
-  getTrip(): string {
-    return storage.getString(K_TRIP) || '';
-  }
-  setTrip(s: string) {
-    storage.set(K_TRIP, (s || '').trim());
-  }
-  getNotes(): string {
-    return storage.getString(K_NOTES) || '';
-  }
-  setNotes(s: string) {
-    storage.set(K_NOTES, (s || '').slice(0, 900));
-  }
-  getNerd(): number {
-    const v = storage.getNumber(K_NERD);
-    return v && v >= 1 && v <= 5 ? v : 3;
-  }
-  setNerd(n: number) {
-    storage.set(K_NERD, n);
-  }
-  getAircraft(): string {
-    return storage.getString(K_AIRCRAFT) || '';
-  }
-  setAircraft(s: string) {
-    storage.set(K_AIRCRAFT, (s || '').trim());
-  }
-  isOn() {
-    return this.on;
-  }
-
-  // ---------- lifecycle ----------
-  start() {
-    if (this.on) {
-      return;
+  // ---------- storage ----------
+  private get(): Core {
+    if (!this.core) {
+      let c: any = null;
+      try {
+        c = JSON.parse(storage.getString(K_CORE) || 'null');
+      } catch (e) {}
+      this.core = c && c.places && c.trips ? c : {v: 1, places: {}, trips: []};
     }
-    this.on = true;
-    this.startedAt = Date.now();
-    this.prevFrame = '';
-    const id = ++this.run;
-    this.loop(id);
+    return this.core as Core;
   }
 
-  stop() {
-    this.on = false;
-    this.run++;
+  private getDos(): Dossiers {
+    if (!this.dos) {
+      let d: any = null;
+      try {
+        d = JSON.parse(storage.getString(K_DOS) || 'null');
+      } catch (e) {}
+      this.dos = d && typeof d === 'object' ? d : {};
+    }
+    return this.dos as Dossiers;
+  }
+
+  private save() {
     try {
-      RadioModule?.stopSpeaking?.();
+      storage.set(K_CORE, JSON.stringify(this.get()));
+      storage.set(K_DOS, JSON.stringify(this.getDos()));
+    } catch (e) {}
+    this.dirty = true;
+  }
+
+  private nameOf(k: string) {
+    const p = this.get().places[k];
+    return p ? p.n : k;
+  }
+
+  // ---------- trips ----------
+  private current(aircraft: string, brief: string): Trip {
+    const c = this.get();
+    const t = now();
+    let tr = c.trips[c.trips.length - 1];
+    if (!tr || tr.z || t - tr.e > TRIP_GAP_S) {
+      tr = {s: t, e: t, a: clip(aircraft, 40), b: clip(brief, 80), p: [], m: ''};
+      c.trips.push(tr);
+    } else {
+      if (aircraft && !tr.a) {
+        tr.a = clip(aircraft, 40);
+      }
+      if (brief && !tr.b) {
+        tr.b = clip(brief, 80);
+      }
+    }
+    return tr;
+  }
+
+  beginSession(aircraft: string, brief: string) {
+    try {
+      this.current(aircraft, brief);
+      this.save();
+      this.autoRestore();
     } catch (e) {}
   }
 
-  async talkNow() {
+  endSession() {
     try {
-      RadioModule?.stopSpeaking?.();
-    } catch (e) {}
-    const id = ++this.run;
-    if (this.on) {
-      this.loop(id);
-      return;
-    }
-    const p = await this.produce(id);
-    if (p) {
-      await this.play(p, id);
-    }
-  }
-
-  private sleep(ms: number) {
-    return new Promise<void>(res => setTimeout(res, Math.max(0, ms)));
-  }
-
-  private log(m: string) {
-    try {
-      RadioModule?.log?.(m);
+      const c = this.get();
+      const tr = c.trips[c.trips.length - 1];
+      if (tr) {
+        tr.e = now();
+      }
+      this.save();
+      this.maybeBackup(true);
     } catch (e) {}
   }
 
-  // The next line is looked at, written and voiced WHILE the current one is still playing, timed so
-  // it is ready the moment the pause after the current line ends. A fresh screenshot is taken
-  // then, so a long line simply delays the next screenshot (dynamic timing).
-  private async loop(id: number) {
-    let next: Promise<any> = this.produce(id);
-    while (this.on && this.run === id) {
-      const prepared = await next;
-      if (!this.on || this.run !== id) {
-        return;
-      }
-      if (!prepared) {
-        await this.sleep(Math.min(15000, Math.max(3000, this.getGapMin() * 1000)));
-        next = this.produce(id);
-        continue;
-      }
-      const gap = prepared.pause;
-      const lead = Math.min(30000, Math.max(5000, this.latencyEma + 2000));
-      const startNextIn = Math.max(0, prepared.ms + gap - lead);
-      next = this.sleep(startNextIn).then(() =>
-        this.on && this.run === id ? this.produce(id) : null,
-      );
-      await this.play(prepared, id);
-      if (!this.on || this.run !== id) {
-        return;
-      }
-      await this.sleep(gap);
+  newTrip() {
+    const c = this.get();
+    const tr = c.trips[c.trips.length - 1];
+    if (tr) {
+      tr.z = 1;
     }
+    this.save();
+    this.maybeBackup(true);
   }
 
-  private async produce(id: number): Promise<any> {
-    const t0 = Date.now();
-    try {
-      const frame: string = await RadioModule.captureFrame(1024, 75);
-      const text = await this.ask(frame);
-      this.prevFrame = frame;
-      this.prevFrameAt = Date.now();
-      if (!text) {
-        this.log('model=' + this.lastModel + ' said=(skip)');
-        return null;
-      }
-      if (this.run !== id) {
-        return null;
-      }
-      this.history.push(text);
-      if (this.history.length > 8) {
-        this.history.shift();
-      }
-      let audio: any = null;
-      if (this.getSpeaker() !== 'Phone voice') {
-        audio = await this.fetchGeminiAudio(text);
-      }
-      const words = text.split(/\s+/).length;
-      const ms = audio ? audio.ms : Math.round((words / 2.6) * 1000);
-      // dynamic pause: the model suggests short/medium/long, nudged by how long the line was, plus jitter
-      const pmin = this.getGapMin() * 1000;
-      const pmax = Math.max(pmin, this.getGapMax() * 1000);
-      let ratio = this.pauseRatio + (ms > 40000 ? 0.15 : ms < 8000 ? -0.1 : 0) + (Math.random() - 0.5) * 0.2;
-      ratio = Math.min(1, Math.max(0, ratio));
-      const pause = Math.round(pmin + (pmax - pmin) * ratio);
-      const lat = Date.now() - t0;
-      this.latencyEma = Math.round(this.latencyEma * 0.6 + lat * 0.4);
-      this.log(
-        'model=' + this.lastModel + ' voice=' + (audio ? this.lastVoice : 'phone') +
-          ' prep=' + lat + 'ms speech=' + ms + 'ms pause=' + pause + 'ms said=' + text,
-      );
-      return {text, audio, ms, pause};
-    } catch (e: any) {
-      this.noteError(e);
+  // ---------- places ----------
+  private find(name: string, code: string): Place | null {
+    const c = this.get();
+    const kc = code ? code.toLowerCase() : '';
+    if (kc && c.places[kc]) {
+      return c.places[kc];
+    }
+    const nn = norm(name);
+    if (!nn && !kc) {
       return null;
     }
-  }
-
-  private async play(p: any, id: number) {
-    if (this.run !== id) {
-      return;
-    }
-    if (this.getCaptions()) {
-      toast('📻 ' + p.text);
-    }
-    RadioModule?.click?.();
-    if (p.audio) {
-      const t0 = Date.now();
-      let ok = false;
-      try {
-        ok = await RadioModule.playPcm(p.audio.data, p.audio.rate);
-      } catch (e) {}
-      // phone voice only if the Gemini audio failed to start at all (never over audio that played)
-      if (ok || Date.now() - t0 > 1500 || this.run !== id) {
-        return;
+    let best: Place | null = null;
+    for (const k in c.places) {
+      const p = c.places[k];
+      if (kc && p.c === kc) {
+        return p;
+      }
+      const pn = norm(p.n);
+      if (!pn || !nn) {
+        continue;
+      }
+      if (pn === nn) {
+        return p;
+      }
+      const a = pn.length < nn.length ? pn : nn;
+      const b = pn.length < nn.length ? nn : pn;
+      if (a.length >= 6 && b.indexOf(a) === 0 && !best) {
+        best = p;
       }
     }
-    await Promise.race([
-      RadioModule?.speak?.(p.text, 1.0, 0.92),
-      this.sleep(p.ms * 1.6 + 15000).then(() => {
-        RadioModule?.stopSpeaking?.();
-        return false;
-      }),
-    ]);
+    return best;
   }
 
-  private noteError(e: any) {
-    const msg = String(e?.message || e);
-    this.lastError = msg;
-    this.log('error: ' + msg);
-    if (/NO_SURFACE|INVALID_SURFACE|NO_ACTIVITY/.test(msg)) {
-      return;
-    }
-    const now = Date.now();
-    if (now - this.lastErrorToastAt > 120000) {
-      this.lastErrorToastAt = now;
-      toast('Radio: ' + msg.slice(0, 120));
+  private bump(p: Place, k: string) {
+    p.x[k] = (p.x[k] || 0) + 1;
+    const keys = Object.keys(p.x);
+    if (keys.length > 8) {
+      keys.sort((a, b) => p.x[a] - p.x[b]);
+      delete p.x[keys[0]];
     }
   }
 
-  // ---------- speaking ----------
-  private ttsCandidates(): string[] {
-    const now = Date.now();
-    let list = TTS_CHAIN.slice();
-    if (this.available) {
-      const all = this.available.filter(m => /tts/i.test(m) && !/argon|carbon/i.test(m));
-      const rank = (m: string) => {
-        if (/hydrogen/i.test(m)) {
-          return -1;
+  private touch(it: {name: string; code: string; region: string; tag: string}, trip: Trip): Place | null {
+    const c = this.get();
+    let p = this.find(it.name, it.code);
+    if (!p) {
+      const k = it.code ? it.code.toLowerCase() : norm(it.name);
+      if (!k) {
+        return null;
+      }
+      p = {k, n: clip(it.name, 40), r: clip(it.region, 24), v: 0, f: now(), l: trip.s, t: '', x: {}};
+      c.places[k] = p;
+    }
+    if (it.code && !p.c) {
+      p.c = it.code.toLowerCase();
+    }
+    if (!p.r && it.region) {
+      p.r = clip(it.region, 24);
+    }
+    if (it.tag) {
+      p.t = addTag(p.t, it.tag);
+    }
+    if (trip.p.indexOf(p.k) < 0) {
+      const prev = trip.p.slice(-3);
+      trip.p.push(p.k);
+      if (trip.p.length > MAX_ROUTE) {
+        trip.p.shift();
+      }
+      if (p.v > 0) {
+        p.o = p.l;
+      }
+      p.l = trip.s;
+      p.v += 1;
+      for (const q of prev) {
+        const o = c.places[q];
+        if (o && o !== p) {
+          this.bump(p, o.k);
+          this.bump(o, p.k);
         }
-        const i = TTS_CHAIN.indexOf(m);
-        return i >= 0 ? i : 50;
-      };
-      list = all.sort((x, y) => rank(x) - rank(y));
-      if (list.length === 0) {
-        list = TTS_CHAIN.slice();
       }
     }
-    return list.filter(m => (this.cooldown[m] || 0) <= now);
+    return p;
   }
 
-  private async fetchGeminiAudio(text: string): Promise<any> {
-    const key = this.getApiKey();
-    for (const model of this.ttsCandidates()) {
-      try {
-        const r = await this.timedFetch(
-          API + '/models/' + model + ':generateContent',
-          {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json', 'x-goog-api-key': key},
-            body: JSON.stringify({
-              contents: [{parts: [{text}]}],
-              generationConfig: {
-                responseModalities: ['AUDIO'],
-                speechConfig: {
-                  voiceConfig: {prebuiltVoiceConfig: {voiceName: this.getSpeaker()}},
-                },
-              },
-            }),
-          },
-          30000,
-        );
-        const raw = await r.text();
-        if (!r.ok) {
-          throw new ApiError(r.status, raw);
-        }
-        const j: any = JSON.parse(raw);
-        const parts: any[] = j?.candidates?.[0]?.content?.parts || [];
-        const ap = parts.find(p => p?.inlineData?.data || p?.inline_data?.data);
-        const inl = ap?.inlineData || ap?.inline_data;
-        if (!inl?.data) {
-          throw new ApiError(0, 'no audio returned');
-        }
-        const mime: string = String(inl.mimeType || inl.mime_type || '');
-        const rate = parseInt((mime.match(/rate=(\d+)/) || [])[1] || '24000', 10);
-        const bytes = Math.floor((String(inl.data).length * 3) / 4);
-        this.lastVoice = model;
-        return {data: inl.data, rate, ms: Math.round((bytes / 2 / rate) * 1000)};
-      } catch (e: any) {
-        if (e instanceof ApiError) {
-          this.setCooldown(model, e);
-        } else {
-          this.cooldown[model] = Date.now() + 3 * 60 * 1000;
-        }
-        this.log('voice fallback from ' + model + ': ' + String(e?.message || e));
+  private addFact(k: string, text: string) {
+    const d = this.getDos();
+    const arr = d[k] || (d[k] = []);
+    const body = clip(text, 120);
+    if (arr.some(x => x.slice(7).toLowerCase() === body.toLowerCase())) {
+      return;
+    }
+    arr.push(iso(now()).slice(2).replace(/-/g, '') + ' ' + body);
+    while (arr.length > MAX_FACTS) {
+      arr.shift();
+    }
+  }
+
+  // Called once per radio turn with what the model reported.
+  ingest(p: Parsed, aircraft: string) {
+    const trip = this.current(aircraft, '');
+    const touched: Place[] = [];
+    for (const it of parsePlaces(p && p.places)) {
+      const pl = this.touch(it, trip);
+      if (pl && touched.indexOf(pl) < 0) {
+        touched.push(pl);
       }
     }
-    return null;
+    const log = clip(noneToEmpty(p && p.log), 160);
+    if (log) {
+      trip.m = addSummary(trip.m, log);
+      if (touched[0]) {
+        this.addFact(touched[0].k, log);
+      }
+    }
+    trip.e = now();
+    // detail for next turn: what the model asked for + where we are now if we have been here before
+    const keys: string[] = [];
+    for (const name of splitList(p && p.recall)) {
+      const f = this.find(name, '');
+      if (f && keys.indexOf(f.k) < 0) {
+        keys.push(f.k);
+      }
+    }
+    for (const t of touched.slice(0, 2)) {
+      if (t.v > 1 && keys.indexOf(t.k) < 0) {
+        keys.push(t.k);
+      }
+    }
+    this.recall = keys.slice(0, 3);
+    this.save();
+    this.maybeBackup(false);
   }
 
-  // ---------- Gemini (brain) ----------
-  private async refreshAvailable(key: string) {
-    if (this.available && Date.now() - this.availableAt < 6 * 3600 * 1000) {
-      return;
+  // ---------- what the model reads ----------
+  formatRules(): string {
+    return (
+      '\nMEMORY: the BRAIN block in each turn is your permanent memory of every past trip. Read all of it. When where we are now, the route, an airport, the aircraft or the situation matches something in it, say so naturally ("we have been here before, last time we..."), but only when BRAIN or RECALLED DETAIL really says so. Never invent past visits.' +
+      '\nAfter the PAUSE line ALWAYS add three more lines in exactly this form:' +
+      '\nPLACES: up to 4 real places we are at, near or approaching right now, nearest first, each written "Name (ICAO code if it is an airport)|Country or region|optional lasting tip of at most 10 words", separated by " ; ". Reuse the exact spelling from BRAIN for places it already lists. NONE if you cannot tell.' +
+      '\nLOG: one genuinely new, lasting fact worth keeping in the logbook (a landing, a first visit, a notable event, a chosen destination, a milestone), 25 words max. NONE if nothing new.' +
+      '\nRECALL: up to 2 place names from BRAIN whose detailed history you would like to see next turn (for example when this looks like somewhere we have been before). NONE if not needed.'
+    );
+  }
+
+  private render(): string {
+    const c = this.get();
+    const keys = Object.keys(c.places);
+    if (!keys.length && !c.trips.length) {
+      return '';
+    }
+    const total = c.trips.length;
+    const years: Record<string, number> = {};
+    const tl: string[] = [];
+    let used = 0;
+    for (let i = total - 1; i >= 0; i--) {
+      const t = c.trips[i];
+      const age = total - 1 - i;
+      const route = t.p.map(k => this.nameOf(k)).join('>');
+      let line = '';
+      if (age < 8) {
+        line = '#' + (i + 1) + ' ' + iso(t.s) + ' ' + (t.a ? t.a + ' ' : '') + route + (t.m ? ' "' + t.m + '"' : '');
+      } else if (age < 20) {
+        line = '#' + (i + 1) + ' ' + iso(t.s) + ' ' + clip(route, 100);
+      }
+      if (!line || used + line.length > BUDGET_TRIPS) {
+        const y = iso(t.s).slice(0, 4);
+        years[y] = (years[y] || 0) + 1;
+        continue;
+      }
+      used += line.length + 1;
+      tl.push(line);
+    }
+    tl.reverse();
+    const ranked = keys.map(k => c.places[k]).sort((a, b) => b.v - a.v || b.l - a.l);
+    const pl: string[] = [];
+    let pu = 0;
+    let omitted = 0;
+    for (const p of ranked) {
+      const links = Object.keys(p.x)
+        .sort((a, b) => p.x[b] - p.x[a])
+        .slice(0, 3)
+        .map(k => this.nameOf(k))
+        .join(',');
+      const line = p.n + '|' + p.r + '|' + p.v + '|' + p.t + (links ? '|~' + links : '');
+      if (pu + line.length > BUDGET_PLACES) {
+        omitted++;
+        continue;
+      }
+      pu += line.length + 1;
+      pl.push(line);
+    }
+    const older = Object.keys(years)
+      .sort()
+      .map(y => y + ': ' + years[y] + ' trips')
+      .join(', ');
+    return (
+      '\nBRAIN (permanent memory of ALL past trips; read all of it every turn):' +
+      '\nPLACES name|region|trips visited|lasting facts|~often flown with:\n' +
+      pl.join('\n') +
+      (omitted ? '\n(+' + omitted + ' minor places are stored; name one in RECALL to read it)' : '') +
+      '\nTRIPS #number date aircraft route "summary", oldest first:\n' +
+      tl.join('\n') +
+      (older ? '\nOLDER TRIPS NOT LISTED: ' + older : '')
+    );
+  }
+
+  private recallText(): string {
+    if (!this.recall.length) {
+      return '';
+    }
+    const c = this.get();
+    const d = this.getDos();
+    const parts: string[] = [];
+    for (const k of this.recall) {
+      const p = c.places[k];
+      if (!p) {
+        continue;
+      }
+      const facts = (d[k] || []).slice(-8).join(' / ');
+      const links = Object.keys(p.x)
+        .sort((a, b) => p.x[b] - p.x[a])
+        .slice(0, 5)
+        .map(x => this.nameOf(x))
+        .join(', ');
+      parts.push(
+        p.n + ' (' + p.v + ' trips, first seen ' + iso(p.f) + (p.o ? ', previous visit ' + iso(p.o) : ', no earlier trip') + '): ' +
+          (facts || 'no extra detail') + (links ? ' | flown with: ' + links : ''),
+      );
+    }
+    return parts.length
+      ? '\nRECALLED DETAIL (full history for places you asked about or that match where we are now):\n' + parts.join('\n')
+      : '';
+  }
+
+  context(): string {
+    if (this.dirty) {
+      this.cache = this.render();
+      this.dirty = false;
+    }
+    const base = this.cache || '\nBRAIN: empty. This is the first recorded trip; start building the memory with PLACES and LOG.';
+    return base + this.recallText();
+  }
+
+  // ---------- logbook (menu) ----------
+  stats() {
+    const c = this.get();
+    return {trips: c.trips.length, places: Object.keys(c.places).length};
+  }
+
+  logbookItems(): Array<{id: string; title: string}> {
+    const c = this.get();
+    const out: Array<{id: string; title: string}> = [];
+    for (let i = c.trips.length - 1; i >= 0 && out.length < 30; i--) {
+      const t = c.trips[i];
+      const names = t.p.map(k => this.nameOf(k));
+      const route =
+        names.length > 2
+          ? names[0] + ' > ' + names[names.length - 1] + ' (' + names.length + ' places)'
+          : names.join(' > ') || 'no places yet';
+      out.push({id: 'radio:b:t:' + (i + 1), title: '#' + (i + 1) + ' ' + iso(t.s) + ' ' + route});
+    }
+    if (!out.length) {
+      out.push({id: 'radio:brain', title: 'Logbook is empty so far'});
+    }
+    return out;
+  }
+
+  tripText(n: number): string {
+    const t = this.get().trips[n - 1];
+    if (!t) {
+      return 'Trip not found';
+    }
+    return (
+      '#' + n + ' ' + iso(t.s) + (t.a ? ' ' + t.a : '') + ': ' +
+      (t.p.map(k => this.nameOf(k)).join(' > ') || 'no places') + (t.m ? ' | ' + t.m : '')
+    );
+  }
+
+  statusText(): string {
+    const c = this.get();
+    const kb = Math.round((JSON.stringify(c).length + JSON.stringify(this.getDos()).length) / 1024);
+    const lb = storage.getNumber(K_LAST_BACKUP);
+    return (
+      'Brain: ' + c.trips.length + ' trips, ' + Object.keys(c.places).length + ' places, ' + kb + ' KB stored, ' +
+      this.render().length + ' characters read by the model each turn | last backup: ' + (lb ? iso(lb) : 'never') +
+      ' (Downloads/XStreamingBackup)' + (this.lastError ? ' | ' + this.lastError : '')
+    );
+  }
+
+  // ---------- backup / restore ----------
+  private exportJson(): string {
+    const settings: any = {};
+    for (const k of SETTING_STR) {
+      const v = storage.getString(k);
+      if (v !== undefined) {
+        settings[k] = v;
+      }
+    }
+    for (const k of SETTING_NUM) {
+      const v = storage.getNumber(k);
+      if (v !== undefined) {
+        settings[k] = v;
+      }
+    }
+    for (const k of SETTING_BOOL) {
+      const v = storage.getBoolean(k);
+      if (v !== undefined) {
+        settings[k] = v;
+      }
+    }
+    return JSON.stringify({app: 'xstreaming-brain', v: 1, ts: now(), core: this.get(), dos: this.getDos(), settings});
+  }
+
+  async backupNow(manual: boolean): Promise<string> {
+    if (!BrainModule || !BrainModule.writeBackup) {
+      return 'Backup is not available in this build';
     }
     try {
-      const r = await this.timedFetch(API + '/models?pageSize=200', {
-        headers: {'x-goog-api-key': key},
-      });
-      if (!r.ok) {
-        return;
+      const json = this.exportJson();
+      const where = await BrainModule.writeBackup(json, BACKUP_LATEST);
+      if (manual) {
+        await BrainModule.writeBackup(json, 'xstreaming-brain-' + iso(now()) + '.json');
       }
-      const j: any = await r.json();
-      const names: string[] = (j?.models || [])
-        .filter((m: any) => (m?.supportedGenerationMethods || []).includes('generateContent'))
-        .map((m: any) => String(m.name || '').replace(/^models\//, ''));
-      if (names.length > 0) {
-        this.available = names;
-        this.availableAt = Date.now();
+      storage.set(K_LAST_BACKUP, now());
+      this.lastError = '';
+      return 'Backed up ' + Math.max(1, Math.round(json.length / 1024)) + ' KB to ' + where;
+    } catch (e: any) {
+      this.lastError = 'backup failed: ' + String((e && e.message) || e).slice(0, 80);
+      return 'Backup failed: ' + String((e && e.message) || e);
+    }
+  }
+
+  private maybeBackup(force: boolean) {
+    const t = now();
+    if (!force && t - this.lastBackupTry < AUTO_BACKUP_S) {
+      return;
+    }
+    this.lastBackupTry = t;
+    this.backupNow(false).then(m => {
+      if (/failed/i.test(m)) {
+        toast(m, true);
+      }
+    });
+  }
+
+  async share(): Promise<string> {
+    if (!BrainModule || !BrainModule.shareBackup) {
+      return 'Sharing is not available in this build';
+    }
+    try {
+      await BrainModule.shareBackup(this.exportJson(), BACKUP_LATEST);
+      return 'Pick where to send the backup';
+    } catch (e: any) {
+      return 'Share failed: ' + String((e && e.message) || e);
+    }
+  }
+
+  async restore(): Promise<string> {
+    if (!BrainModule || !BrainModule.pickBackup) {
+      return 'Restore is not available in this build';
+    }
+    try {
+      const txt: string = await BrainModule.pickBackup();
+      return this.importJson(txt);
+    } catch (e: any) {
+      const m = String((e && (e.code || e.message)) || e);
+      return /CANCEL/i.test(m) ? 'Restore cancelled' : 'Restore failed: ' + m;
+    }
+  }
+
+  private mergeTags(a: string, b: string) {
+    let out = a;
+    for (const seg of (b || '').split('; ')) {
+      out = addTag(out, seg);
+    }
+    return out;
+  }
+
+  private importJson(txt: string): string {
+    let j: any = null;
+    try {
+      j = JSON.parse(txt);
+    } catch (e) {}
+    if (!j || j.app !== 'xstreaming-brain' || !j.core || !j.core.places || !j.core.trips) {
+      return 'That file is not an XStreaming brain backup';
+    }
+    const a = this.get();
+    const b: Core = j.core;
+    for (const k in b.places) {
+      const q = b.places[k];
+      const p = a.places[k];
+      if (!p) {
+        a.places[k] = q;
+        continue;
+      }
+      p.v = Math.max(p.v, q.v);
+      p.f = Math.min(p.f, q.f);
+      p.l = Math.max(p.l, q.l);
+      p.o = Math.max(p.o || 0, q.o || 0) || undefined;
+      p.t = this.mergeTags(p.t, q.t);
+      if (!p.r) {
+        p.r = q.r;
+      }
+      if (!p.c && q.c) {
+        p.c = q.c;
+      }
+      for (const x in q.x) {
+        p.x[x] = Math.max(p.x[x] || 0, q.x[x]);
+      }
+    }
+    const idx: Record<number, number> = {};
+    a.trips.forEach((t, i) => {
+      idx[t.s] = i;
+    });
+    for (const t of b.trips) {
+      const i = idx[t.s];
+      if (i === undefined) {
+        a.trips.push(t);
+      } else if (t.p.length > a.trips[i].p.length || t.m.length > a.trips[i].m.length) {
+        a.trips[i] = t;
+      }
+    }
+    a.trips.sort((x, y) => x.s - y.s);
+    const d = this.getDos();
+    const bd: Dossiers = j.dos || {};
+    for (const k in bd) {
+      const arr = d[k] || (d[k] = []);
+      for (const line of bd[k]) {
+        if (arr.indexOf(line) < 0) {
+          arr.push(line);
+        }
+      }
+      arr.sort();
+      while (arr.length > MAX_FACTS) {
+        arr.shift();
+      }
+    }
+    // settings: only fill in what is not set yet, never overwrite your current choices
+    const s = j.settings || {};
+    for (const k of SETTING_STR) {
+      if (typeof s[k] === 'string' && storage.getString(k) === undefined) {
+        storage.set(k, s[k]);
+      }
+    }
+    for (const k of SETTING_NUM) {
+      if (typeof s[k] === 'number' && storage.getNumber(k) === undefined) {
+        storage.set(k, s[k]);
+      }
+    }
+    for (const k of SETTING_BOOL) {
+      if (typeof s[k] === 'boolean' && storage.getBoolean(k) === undefined) {
+        storage.set(k, s[k]);
+      }
+    }
+    this.save();
+    return 'Restored: ' + a.trips.length + ' trips, ' + Object.keys(a.places).length + ' places';
+  }
+
+  // empty brain on a fresh install: quietly try the last backup, otherwise point at the Restore button
+  private async autoRestore() {
+    const c = this.get();
+    if (this.restoring || this.warned || Object.keys(c.places).length > 0 || c.trips.length > 1) {
+      return;
+    }
+    this.restoring = true;
+    try {
+      const txt: any = BrainModule && BrainModule.readLatestBackup ? await BrainModule.readLatestBackup(BACKUP_LATEST) : null;
+      if (txt) {
+        toast(this.importJson(String(txt)) + ' (automatic)', true);
+      } else {
+        toast('Brain is empty. Had a backup? Sim Radio > Brain, logbook and backup > Restore.', true);
+      }
+    } catch (e) {
+    } finally {
+      this.restoring = false;
+      this.warned = true;
+    }
+  }
+
+  // ---------- black OLED radio screen ----------
+  async showBlackout() {
+    try {
+      await BrainModule.showBlackout(true);
+      toast('Black radio screen on. Hold a finger on the screen for 1.5 s to go back.', true);
+    } catch (e: any) {
+      toast('Could not show the black screen: ' + String((e && e.message) || e), true);
+    }
+  }
+
+  hideBlackout() {
+    try {
+      if (BrainModule && BrainModule.hideBlackout) {
+        BrainModule.hideBlackout();
       }
     } catch (e) {}
   }
+}
 
-  private async timedFetch(url: string, init: any, ms = 20000) {
-    const ctrl = new AbortController();
-    const t = setTimeout(() => ctrl.abort(), ms);
-    try {
-      return await fetch(url, {...init, signal: ctrl.signal});
-    } finally {
-      clearTimeout(t);
-    }
-  }
+const brain = new Brain();
+export default brain;
+'''
 
-  private candidates(): string[] {
-    const now = Date.now();
-    const hydro = (this.available || []).filter(
-      m => /hydrogen/i.test(m) && !/tts|image|live|audio|embed|robot/i.test(m),
-    );
-    const base = this.available ? MODEL_CHAIN.filter(m => this.available!.includes(m)) : MODEL_CHAIN;
-    const merged = hydro.concat(base.filter(m => !hydro.includes(m)));
-    const list = merged.length > 0 ? merged : MODEL_CHAIN;
-    return list.filter(m => (this.cooldown[m] || 0) <= now);
-  }
+FURTHER_PLANS = r'''# Brain / radio: further plans
 
-  private setCooldown(model: string, e: ApiError) {
-    const b = e.body || '';
-    let ms = 3 * 60 * 1000;
-    if (e.status === 503 || e.status === 500 || e.status === 504) {
-      ms = 5 * 60 * 1000;
-    } else if (e.status === 429) {
-      ms = /PerDay|per day|daily/i.test(b) ? 6 * 3600 * 1000 : 10 * 60 * 1000;
-    } else if (e.status === 404 || e.status === 400) {
-      ms = 6 * 3600 * 1000;
-    } else if (e.status === 403) {
-      ms = 30 * 60 * 1000;
-    }
-    this.cooldown[model] = Date.now() + ms;
-  }
+Things that were left out on purpose, or only partly done, with the reason.
 
-  private pickSegment(): string {
-    const level = NERD_LEVELS.find(n => n.id === this.getNerd()) || NERD_LEVELS[2];
-    const weights = SEGMENTS.map((s, i) => (i === this.lastSegment ? 0 : s.nerd ? level.weight : 1));
-    const total = weights.reduce((x, y) => x + y, 0);
-    let r = Math.random() * total;
-    let pick = 0;
-    for (let i = 0; i < weights.length; i++) {
-      r -= weights[i];
-      if (r <= 0) {
-        pick = i;
-        break;
+## Done in the brain patch
+- Permanent memory of every trip and place (src/utils/brain.ts). The model reads the whole compact brain every turn.
+- Backup file in Downloads/XStreamingBackup (survives an app wipe or uninstall), restore picker, share sheet.
+- Black OLED radio screen. The stream keeps running underneath it; hold a finger on the screen for 1.5 s to go back.
+- A small screenshot every 10 s, sent as one batch with the next prompt.
+
+## Not done (yet)
+- **True screen-off radio.** Turning the display fully off would let Android throttle the app and the stream.
+  The black screen keeps the stream alive instead. A foreground service with a wake lock could allow a real
+  screen-off mode, but it needs a new notification channel and a manifest change.
+- **Model-triggered lookups (function calling).** The model currently "opens the brain" through the RECALL line,
+  which is answered on the next turn. Real Gemini function calling would answer in the same turn but costs one
+  extra round trip per lookup.
+- **Per-image resolution.** The 10 s screenshots are sent at 512 px and the main frame at 1600 px. Gemini 3 models
+  accept a per-image resolution hint; it is not used because support differs between the free-tier models.
+- **Pictures in the backup.** Left out as requested. The brain is text only (a few hundred KB after years of flying).
+- **Cloud sync.** The share button sends the backup to Drive or email by hand. Automatic sync would need a sign-in.
+- **API key in the backup.** Deliberately excluded because the file sits in Downloads where other apps can read it.
+'''
+
+
+# ------------------------------------------------------------------------------------------
+# radio.ts edits
+# ------------------------------------------------------------------------------------------
+CONSTS = r"""
+// BRAIN: picture sizes and the 10-second screenshot batch
+const FRAME_W = 1600; // main frame width (was 1024). Output is capped by the stream's own resolution.
+const FRAME_Q = 85; // JPEG quality of the main frame (was 75)
+const BURST_W = 512; // width of the small 10-second screenshots
+const BURST_Q = 60;
+const BURST_EVERY_MS = 10000;
+const BURST_KEEP = 36; // about 6 minutes of history
+const BURST_SEND = 8; // at most this many small screenshots go with each prompt
+const BURST_MAX_AGE_MS = 6 * 60 * 1000;"""
+
+SEGMENT_ADD = r"""  {t: 'memory callback: if BRAIN or RECALLED DETAIL shows we have been to or near this place, flown this route or met this situation before, tell the listener what happened or what we learned last time; if nothing matches, do a normal segment instead', nerd: false},
+  {t: 'connect two places from BRAIN: say how this place relates to somewhere else we have flown, for example the route between them, a shared history or what we did on the way', nerd: false},
+"""
+
+FIELDS = r"""  private pauseRatio = 0.4;
+  // BRAIN: 10-second screenshot batch
+  private burst: Array<{t: number; d: string}> = [];
+  private activeBurst: Array<{t: number; d: string}> = [];
+  private burstTimer: any = null;
+  private burstBusy = false;
+  private burstNote = '';
+"""
+
+BURST_METHODS = r"""  // BRAIN: a small screenshot every 10 s, sent as one batch with the next prompt
+  private startBurst() {
+    this.stopBurst();
+    this.burst = [];
+    this.burstTimer = setInterval(async () => {
+      if (this.burstBusy || !this.on) {
+        return;
       }
+      this.burstBusy = true;
+      try {
+        const d: string = await RadioModule.captureFrame(BURST_W, BURST_Q);
+        const last = this.burst[this.burst.length - 1];
+        if (d && (!last || last.d !== d)) {
+          this.burst.push({t: Date.now(), d});
+        }
+        while (this.burst.length > BURST_KEEP) {
+          this.burst.shift();
+        }
+      } catch (e) {
+      } finally {
+        this.burstBusy = false;
+      }
+    }, BURST_EVERY_MS);
+  }
+
+  private stopBurst() {
+    if (this.burstTimer) {
+      clearInterval(this.burstTimer);
+      this.burstTimer = null;
     }
-    this.lastSegment = pick;
-    return SEGMENTS[pick].t;
+    this.burst = [];
   }
 
-  private buildPrompt(hasPrev: boolean): {system: string; user: string} {
-    const persona = PERSONAS.find(p => p.id === this.getPersonaId()) || PERSONAS[0];
-    const system =
-      persona.prompt +
-      '\n\nYou are both the brain and the voice of the show. Each turn you get the current screen from the game stream' +
-      (hasPrev ? ' (plus an earlier screen so you can see movement)' : '') +
-      ', the trip brief, your running notebook and your recent lines.' +
-      '\nAIRCRAFT RULE: the aircraft can change from flight to flight. Never assume a type. Identify it from the AIRCRAFT and TRIP BRIEF lines and from anything visible (HUD, instrument panel, aircraft name or registration, ATC callsign). If the screen contradicts the brief, trust the screen and carry the correct type in your notebook. If you genuinely cannot tell, say "the aircraft" without naming a type. Keep any technical or handling talk true to the actual aircraft.' +
-      '\nREAD ALL ON-SCREEN TEXT carefully: HUD and instrument readouts, map, place-name and UI banners, waypoint and airport identifiers, ATC subtitles and callsigns. From these, work out exactly where the aircraft is and what is below, ahead and nearby, then use your world knowledge to talk about the REAL place: its landmarks, rivers, towns, mountains, history, wildlife and culture. If you cannot justify a place from the screen or notebook, hedge once ("looks like...") instead of inventing.' +
-      '\nReply in EXACTLY this format:' +
-      '\nSTATE: <60 words max. Updated notebook: where we are (place names, airfield, region), the aircraft type if known, heading/altitude/phase of flight, landmarks passed, next expected landmark or waypoint, anything the pilot is doing, and any destination you have suggested. Keep useful facts from the old notebook.>' +
-      '\nSAY: <the words to speak aloud>' +
-      '\nPAUSE: <short | medium | long: how long to leave before you speak again. short = a quick follow-up thought or reaction, medium = normal, long = after a big story, or when the pilot is busy (takeoff, landing, heavy ATC traffic) or just let them enjoy the view>' +
-      '\nBORING SCENERY RULE: if the view is empty or featureless (open desert, endless fields, open sea, thick cloud, nothing to point at), do NOT waffle about sand or emptiness. Pivot: recommend somewhere genuinely worth flying to from the current position (a famous landmark, scenic coastline, interesting airport, canyon, city skyline or unusual place), with the rough compass direction, distance and flying time and one reason it is great. Make it a real suggestion the pilot can act on. If the notebook shows you suggested a destination and the pilot now seems to be heading that way, notice it and get excited about it. Never suggest places you are not sure exist.' +
-      '\nCONVERSATION RULE: you are a good radio host, not a tour-guide script. Mix place facts with natural talk: song recommendations (title and artist only, never lyrics), asides about science, engineering, aviation, geography or language that a curious person would love (as far as the NERD LEVEL allows), light opinions and questions to the pilot. The NERD LEVEL line each turn says how technical to get. Be correct: if unsure of a fact, leave it out.' +
-      '\nSAY rules: length follows what you have to say: sometimes one punchy sentence (15 words), usually 40 to 90 words, and occasionally a proper story up to 150 words (about a minute spoken). Write for the ear like a real broadcaster: contractions, short sentences mixed with longer ones, dashes and ellipses for natural pauses, spoken numbers ("nine hundred feet"). Specific and concrete with named places and facts. No lists, no emojis, no markdown, no stage directions, never mention instructions or tone. Never merely describe the picture: every line must carry a specific name, fact, story or reaction to an ATC call. Never repeat or rephrase your earlier lines. If the screen is only a loading screen, black or an unchanged menu, write SAY: SKIP' +
-      '\nTIMING: the listener hears your line roughly ' + Math.round(this.latencyEma / 1000 + (this.getGapMin() + this.getGapMax()) / 4 + 4) + ' seconds after this screenshot, so favour what is coming up ahead and what we have just passed over what is directly below this instant.';
-    const recent = this.history.slice(-6);
-    const mins = this.startedAt ? Math.round((Date.now() - this.startedAt) / 60000) : 0;
-    const prevAge = this.prevFrameAt ? Math.round((Date.now() - this.prevFrameAt) / 1000) : 0;
-    const user =
-      'AIRCRAFT: ' + (this.getAircraft() || '(not set: work it out from the trip brief or the screen)') +
-      '\nTRIP BRIEF: ' + (this.getTrip() || '(none given; work it out from the screen)') +
-      '\nNERD LEVEL ' + this.getNerd() + ' of 5: ' + ((NERD_LEVELS.find(n => n.id === this.getNerd()) || NERD_LEVELS[2]).directive) +
-      '\nNOTEBOOK: ' + (this.getNotes() || '(empty, first transmission)') +
-      '\nON AIR FOR: ' + mins + ' min' +
-      (recent.length ? '\nYOUR RECENT LINES (do not repeat): ' + recent.map(h => '"' + h + '"').join(' | ') : '') +
-      '\nSEGMENT FOR THIS TURN: ' + this.pickSegment() +
-      (hasPrev ? '\nThe first image is about ' + prevAge + ' seconds ago, the second is NOW.' : '\nThe image is the screen NOW.');
-    return {system, user};
+  // everything captured since the last prompt, thinned to BURST_SEND frames spread over the whole gap
+  private drainBurst(): Array<{t: number; d: string}> {
+    const cutoff = Date.now() - BURST_MAX_AGE_MS;
+    const all = this.burst.filter(b => b.t >= cutoff);
+    this.burst = [];
+    if (all.length <= BURST_SEND) {
+      return all;
+    }
+    const out: Array<{t: number; d: string}> = [];
+    for (let i = 0; i < BURST_SEND; i++) {
+      out.push(all[Math.round((i * (all.length - 1)) / (BURST_SEND - 1))]);
+    }
+    return out;
   }
 
-  private async generate(model: string, key: string, frame: string) {
-    const hasPrev = !!this.prevFrame;
+  private sleep(ms: number) {"""
+
+GENERATE_OLD = r"""    const hasPrev = !!this.prevFrame;
     const {system, user} = this.buildPrompt(hasPrev);
     const parts: any[] = [{text: user}];
     if (hasPrev) {
       parts.push({inline_data: {mime_type: 'image/jpeg', data: this.prevFrame}});
     }
     parts.push({inline_data: {mime_type: 'image/jpeg', data: frame}});
-    // keep "thinking" minimal for speed; fall back through the config styles different generations accept
-    const modes: any[] = [{thinkingBudget: 0}, {thinkingLevel: 'low'}, null];
-    for (let attempt = 0; attempt < 3; attempt++) {
-      const mode = Math.min(this.thinkMode[model] || 0, 2);
-      const cfg: any = {temperature: 1.0, maxOutputTokens: 2048};
-      if (modes[mode]) {
-        cfg.thinkingConfig = modes[mode];
-      }
-      const r = await this.timedFetch(
-        API + '/models/' + model + ':generateContent',
-        {
-          method: 'POST',
-          headers: {'Content-Type': 'application/json', 'x-goog-api-key': key},
-          body: JSON.stringify({
-            systemInstruction: {parts: [{text: system}]},
-            contents: [{role: 'user', parts}],
-            generationConfig: cfg,
-          }),
-        },
-        16000,
-      );
-      const raw = await r.text();
-      if (!r.ok) {
-        if (r.status === 400 && /think/i.test(raw) && mode < 2) {
-          this.thinkMode[model] = mode + 1;
-          continue;
-        }
-        throw new ApiError(r.status, raw);
-      }
-      let j: any = {};
-      try {
-        j = JSON.parse(raw);
-      } catch (e) {}
-      if (j?.promptFeedback?.blockReason) {
-        return 'STATE:\nSAY: SKIP';
-      }
-      const ps: any[] = j?.candidates?.[0]?.content?.parts || [];
-      const text = ps
-        .filter(p => typeof p?.text === 'string' && !p.thought)
-        .map(p => p.text)
-        .join(' ')
-        .trim();
-      if (!text) {
-        throw new ApiError(0, 'empty reply (' + (j?.candidates?.[0]?.finishReason || '?') + ')');
-      }
-      return text;
+"""
+
+GENERATE_NEW = r"""    // BRAIN: the batch of small earlier screenshots, then the sharp one from right now
+    const burst =
+      this.activeBurst.length > 0
+        ? this.activeBurst
+        : this.prevFrame
+        ? [{t: this.prevFrameAt, d: this.prevFrame}]
+        : [];
+    const hasPrev = burst.length > 0;
+    const nowMs = Date.now();
+    this.burstNote = hasPrev
+      ? '\nThe first ' + burst.length + ' image(s) are smaller screenshots from earlier, oldest first, taken about ' +
+        burst.map(b => Math.max(0, Math.round((nowMs - b.t) / 1000)) + 's').join(', ') +
+        ' ago, so you can follow the movement and what changed. The LAST image is the sharp full-size screen NOW: read all text from it.'
+      : '\nThe image is the screen NOW.';
+    const {system, user} = this.buildPrompt(hasPrev);
+    const parts: any[] = [{text: user}];
+    for (const b of burst) {
+      parts.push({inline_data: {mime_type: 'image/jpeg', data: b.d}});
     }
-    throw new ApiError(0, 'thinking config rejected');
-  }
+    parts.push({inline_data: {mime_type: 'image/jpeg', data: frame}});
+"""
 
-  private clean(t: string) {
-    return t
-      .replace(/[*_#`~]/g, '')
-      .replace(/\s+/g, ' ')
-      .trim();
-  }
+PARSE_START = "  private parse(out: string): {say: string; state: string; pause: number} {\n"
+PARSE_END = "    return {state: '', say: this.clean(out.replace(/^SAY:\\s*/i, '')), pause: 0.45};\n  }\n"
 
-  private parse(out: string): {say: string; state: string; pause: number} {
-    const m = out.match(/STATE:\s*([\s\S]*?)\s*SAY:\s*([\s\S]*?)(?:\s*PAUSE:\s*(\w+))?\s*$/i);
+PARSE_NEW = r"""  // BRAIN: label-based parser. Fields: STATE, SAY, PAUSE, PLACES, LOG, RECALL (the last three feed the brain)
+  private parse(out: string): any {
+    const re = /(?:^|\n)[ \t]*\**(STATE|SAY|PAUSE|PLACES|LOG|RECALL)\**[ \t]*:[ \t]*/gi;
+    const marks: Array<{k: string; s: number; e: number}> = [];
+    let m: RegExpExecArray | null = re.exec(out);
+    while (m) {
+      marks.push({k: m[1].toUpperCase(), s: m.index, e: re.lastIndex});
+      m = re.exec(out);
+    }
+    const f: Record<string, string> = {};
+    for (let i = 0; i < marks.length; i++) {
+      const end = i + 1 < marks.length ? marks[i + 1].s : out.length;
+      if (f[marks[i].k] === undefined) {
+        f[marks[i].k] = out.slice(marks[i].e, end);
+      }
+    }
     const pr = (w?: string) => {
       const k = String(w || '').toLowerCase();
-      return k === 'short' ? 0.08 : k === 'long' ? 0.92 : 0.45;
+      return k.indexOf('short') === 0 ? 0.08 : k.indexOf('long') === 0 ? 0.92 : 0.45;
     };
-    if (m) {
-      return {state: this.clean(m[1]), say: this.clean(m[2]), pause: pr(m[3])};
+    const keep = (s?: string) => String(s || '').replace(/[*`#]/g, '').trim();
+    if (f.SAY === undefined) {
+      return {state: '', say: this.clean(out), pause: 0.45, places: '', log: '', recall: ''};
     }
-    return {state: '', say: this.clean(out.replace(/^SAY:\s*/i, '')), pause: 0.45};
+    return {
+      state: this.clean(f.STATE || ''),
+      say: this.clean(f.SAY),
+      pause: pr(this.clean(f.PAUSE || '').split(' ')[0]),
+      places: keep(f.PLACES),
+      log: this.clean(f.LOG || ''),
+      recall: keep(f.RECALL),
+    };
   }
+"""
 
-  private async ask(frame: string): Promise<string> {
-    const key = this.getApiKey();
-    if (!key) {
-      throw new Error('no Gemini API key set');
-    }
-    await this.refreshAvailable(key);
-    let tried = 0;
-    for (const model of this.candidates()) {
-      tried++;
-      try {
-        const {say, state, pause} = this.parse(await this.generate(model, key, frame));
-        this.pauseRatio = pause;
-        this.lastModel = model;
-        this.lastError = '';
-        if (state) {
-          this.setNotes(state);
-        }
-        if (!say || /^SKIP\b/i.test(say)) {
-          return '';
-        }
-        return say;
-      } catch (e: any) {
-        if (e instanceof ApiError) {
-          if (e.status === 401 || (e.status === 400 && /API key/i.test(e.body))) {
-            throw new Error('API key rejected by Google');
-          }
-          this.setCooldown(model, e);
-          this.lastError = model + ': ' + e.message;
-        } else {
-          this.cooldown[model] = Date.now() + 3 * 60 * 1000;
-          this.lastError = model + ': ' + (e?.name === 'AbortError' ? 'timeout' : String(e?.message || e));
-        }
-        this.log('fallback from ' + model + ' -> ' + this.lastError);
-      }
-    }
-    if (tried === 0) {
-      throw new Error('all models capped, waiting for quota');
-    }
-    throw new Error('all models failed. last: ' + this.lastError);
-  }
+MENU_MAIN = r"""          {id: 'radio:tripair', title: 'Trip and aircraft'},
+          {id: 'radio:brain', title: 'Brain, logbook and backup'},
+          {id: 'radio:oled', title: 'Black radio screen (OLED)'},
+"""
 
-  statusText(): string {
-    const now = Date.now();
-    const capped = Object.keys(this.cooldown).filter(m => this.cooldown[m] > now);
-    return (
-      (this.on ? 'ON' : 'OFF') +
-      ' | brain: ' + (this.lastModel || 'none yet') +
-      ' | prep ' + Math.round(this.latencyEma / 1000) + 's | voice: ' + (this.getSpeaker() === 'Phone voice' ? 'phone' : this.lastVoice || 'none yet') +
-      (capped.length ? ' | capped: ' + capped.join(', ') : '') +
-      (this.lastError ? ' | last error: ' + this.lastError.slice(0, 140) : '')
-    );
-  }
-
-  // ---------- UI helpers (the app's native dialogs) ----------
-  async promptForKey(showInput: (o: any) => Promise<any>) {
-    const r = await showInput({
-      title: 'Gemini API key',
-      message: 'Free key from aistudio.google.com/apikey',
-      hint: 'AIza...',
-      text: this.getApiKey(),
-      maxLength: 200,
-      confirmText: 'Save',
-      cancelText: 'Cancel',
-    });
-    if (r?.action === 'confirm') {
-      this.setApiKey(r.text || '');
-      this.available = null;
-      this.cooldown = {};
-      toast(this.getApiKey() ? 'Gemini key saved' : 'Key cleared');
-    }
-  }
-
-  async promptForTrip(showInput: (o: any) => Promise<any>) {
-    const r = await showInput({
-      title: 'Trip brief',
-      message: 'Route, legs, stops, goals, what you are up to today. The radio uses this every time. (The aircraft has its own setting.)',
-      hint: 'e.g. world tour, leg 3 of 12, sightseeing around the coast',
-      text: this.getTrip(),
-      maxLength: 500,
-      confirmText: 'Save',
-      cancelText: 'Cancel',
-    });
-    if (r?.action === 'confirm') {
-      this.setTrip(r.text || '');
-      toast('Trip brief saved');
-    }
-  }
-
-  async promptForAircraft(showInput: (o: any) => Promise<any>) {
-    const r = await showInput({
-      title: 'Aircraft',
-      message: 'What you are flying right now. Leave empty to let the radio work it out from the screen.',
-      hint: 'e.g. type, make, livery or registration',
-      text: this.getAircraft(),
-      maxLength: 80,
-      confirmText: 'Save',
-      cancelText: 'Cancel',
-    });
-    if (r?.action === 'confirm') {
-      this.setAircraft(r.text || '');
-      toast(this.getAircraft() ? 'Aircraft saved' : 'Aircraft cleared (auto)');
-    }
-  }
-
-  async openMenu(
-    showOptions: (items: any[], o?: any) => Promise<any>,
-    showInput: (o: any) => Promise<any>,
-  ) {
-    const pause = () => new Promise(r => setTimeout(r, 150));
-    let screen = 'main';
-    for (let guard = 0; guard < 40; guard++) {
-      const pid = this.getPersonaId();
-      const gmin = this.getGapMin();
-      const gmax = this.getGapMax();
-      const spk = this.getSpeaker();
-      let items: any[] = [];
-      if (screen === 'main') {
-        const pname = (PERSONAS.find(p => p.id === pid) || PERSONAS[0]).name;
+MENU_SCREENS = r"""      } else if (screen === 'brain') {
+        const st = brain.stats();
         items = [
-          {id: 'radio:toggle', title: this.on ? 'Stop radio' : 'Start radio', active: this.on},
-          {id: 'radio:now', title: 'Talk now'},
-          {id: 'radio:voice', title: 'Character: ' + pname},
-          {id: 'radio:speaker', title: 'Voice: ' + spk},
-          {id: 'radio:nerd', title: 'Nerd level: ' + this.getNerd() + ' of 5'},
-          {id: 'radio:tripair', title: 'Trip and aircraft'},
-          {id: 'radio:more', title: 'More settings'},
+          {id: 'radio:b:trips', title: 'Logbook: ' + st.trips + ' trips, ' + st.places + ' places (tap to read)'},
+          {id: 'radio:b:newtrip', title: 'End this trip, next one starts fresh'},
+          {id: 'radio:b:backup', title: 'Back up everything now'},
+          {id: 'radio:b:share', title: 'Share backup (Drive, email...)'},
+          {id: 'radio:b:restore', title: 'Restore from a backup file'},
+          {id: 'radio:b:status', title: 'Brain size and last backup'},
+          {id: 'radio:back', title: 'Back'},
         ];
-      } else if (screen === 'voice') {
-        items = PERSONAS.map(p => ({id: 'radio:persona:' + p.id, title: p.name, active: p.id === pid}));
-        items.push({id: 'radio:back', title: 'Back'});
-      } else if (screen === 'nerd') {
-        const nl = this.getNerd();
-        items = NERD_LEVELS.map(n => ({id: 'radio:nerdlvl:' + n.id, title: n.name, active: n.id === nl}));
-        items.push({id: 'radio:back', title: 'Back'});
+      } else if (screen === 'logbook') {
+        items = brain.logbookItems();
+        items.push({id: 'radio:brain', title: 'Back'});
       } else if (screen === 'tripair') {
-        items = [
-          {id: 'radio:trip', title: this.getTrip() ? 'Trip brief: set' : 'Trip brief: not set'},
-          {id: 'radio:aircraft', title: this.getAircraft() ? 'Aircraft: ' + this.getAircraft().slice(0, 30) : 'Aircraft: auto-detect'},
-          {id: 'radio:back', title: 'Back'},
-        ];
-      } else if (screen === 'speaker') {
-        items = SPEAKERS.map(s => ({id: 'radio:spk:' + s.id, title: s.name, active: s.id === spk}));
-        items.push({id: 'radio:back', title: 'Back'});
-      } else if (screen === 'gapmin') {
-        items = GAP_MINS.map(s => ({id: 'radio:gmin:' + s, title: 'Shortest pause: ' + s + ' seconds', active: s === gmin}));
-        items.push({id: 'radio:more', title: 'Back'});
-      } else if (screen === 'gapmax') {
-        items = GAP_MAXS.map(s => ({id: 'radio:gmax:' + s, title: 'Longest pause: ' + s + ' seconds', active: s === gmax}));
-        items.push({id: 'radio:more', title: 'Back'});
-      } else {
-        items = [
-          {id: 'radio:gapmin', title: 'Shortest pause: ' + gmin + 's'},
-          {id: 'radio:gapmax', title: 'Longest pause: ' + gmax + 's'},
-          {id: 'radio:key', title: this.getApiKey() ? 'API key: set' : 'API key: NOT SET'},
-          {id: 'radio:captions', title: 'Captions', active: this.getCaptions()},
-          {id: 'radio:forget', title: 'Forget trip notebook'},
-          {id: 'radio:status', title: 'Status / last error'},
-          {id: 'radio:back', title: 'Back'},
-        ];
-      }
-      const res = await showOptions(items, {});
-      if (res?.action !== 'select') {
+"""
+
+MENU_HANDLERS = r"""      } else if (id === 'radio:brain') {
+        screen = 'brain';
+      } else if (id === 'radio:oled') {
+        await brain.showBlackout();
         return;
-      }
-      const id: string = String(res.id || '');
-      if (id === 'radio:toggle') {
-        if (this.on) {
-          this.stop();
-          toast('Sim Radio off');
-        } else {
-          if (!this.getApiKey()) {
-            await this.promptForKey(showInput);
-          }
-          if (this.getApiKey()) {
-            this.start();
-            toast('Sim Radio on');
-          }
+      } else if (id.startsWith('radio:b:')) {
+        const sub = id.slice('radio:b:'.length);
+        if (sub === 'trips') {
+          screen = 'logbook';
+        } else if (sub.startsWith('t:')) {
+          toast(brain.tripText(parseInt(sub.slice(2), 10) || 0), true);
+        } else if (sub === 'newtrip') {
+          brain.newTrip();
+          toast('Trip closed. The next transmission starts a new trip.', true);
+        } else if (sub === 'backup') {
+          toast(await brain.backupNow(true), true);
+        } else if (sub === 'share') {
+          toast(await brain.share(), true);
+        } else if (sub === 'restore') {
+          toast(await brain.restore(), true);
+        } else if (sub === 'status') {
+          toast(brain.statusText(), true);
         }
-        return;
-      } else if (id === 'radio:now') {
-        if (!this.getApiKey()) {
-          await this.promptForKey(showInput);
-        }
-        if (this.getApiKey()) {
-          this.talkNow();
-        }
-        return;
-      } else if (id === 'radio:voice') {
-        screen = 'voice';
-      } else if (id === 'radio:speaker') {
-        screen = 'speaker';
-      } else if (id === 'radio:gapmin') {
-        screen = 'gapmin';
-      } else if (id === 'radio:gapmax') {
-        screen = 'gapmax';
-      } else if (id === 'radio:more') {
-        screen = 'more';
-      } else if (id === 'radio:back') {
-        screen = 'main';
-      } else if (id === 'radio:nerd') {
-        screen = 'nerd';
-      } else if (id === 'radio:tripair') {
-        screen = 'tripair';
-      } else if (id === 'radio:aircraft') {
-        await this.promptForAircraft(showInput);
       } else if (id.startsWith('radio:nerdlvl:')) {
-        this.setNerd(parseInt(id.slice('radio:nerdlvl:'.length), 10) || 3);
-        screen = 'main';
-      } else if (id === 'radio:trip') {
-        await this.promptForTrip(showInput);
-      } else if (id === 'radio:key') {
-        await this.promptForKey(showInput);
-      } else if (id === 'radio:captions') {
-        this.setCaptions(!this.getCaptions());
-      } else if (id === 'radio:forget') {
-        this.setNotes('');
-        this.history = [];
-        this.prevFrame = '';
-        toast('Notebook cleared');
-      } else if (id === 'radio:status') {
-        toast(this.statusText(), true);
-      } else if (id.startsWith('radio:persona:')) {
-        this.setPersonaId(id.slice('radio:persona:'.length));
-        this.history = [];
-        screen = 'main';
-      } else if (id.startsWith('radio:spk:')) {
-        this.setSpeaker(id.slice('radio:spk:'.length));
-        screen = 'main';
-      } else if (id.startsWith('radio:gmin:')) {
-        this.setGapMin(parseInt(id.slice('radio:gmin:'.length), 10) || 4);
-        screen = 'more';
-      } else if (id.startsWith('radio:gmax:')) {
-        this.setGapMax(parseInt(id.slice('radio:gmax:'.length), 10) || 40);
-        screen = 'more';
-      }
-      await pause();
-    }
-  }
-}
+"""
 
-const radio = new SimRadio();
-export default radio;
-'''
 
-# ------------------------------------------------------------------------------------------
-# NativeStream.tsx edits
-# ------------------------------------------------------------------------------------------
-CASES = r'''      // RADIO ---- Sim Radio
-      case 'toggleStreamMute': {
-        if (audioGain === 0) {
-          handleAudioGainChange(muteRestoreGainRef.current || 1);
-        } else {
-          muteRestoreGainRef.current = audioGain;
-          handleAudioGainChange(0);
-        }
-        break;
-      }
-      case 'radioMenu': {
-        try {
-          GamepadManager.setCurrentScreen('');
-          resumeGamepadNavigation();
-          await radio.openMenu(showNativeOptionsDialog, showNativeInputDialog);
-        } catch (err: any) {
-          ToastAndroid.show(err?.message || 'Radio error', ToastAndroid.SHORT);
-        } finally {
-          GamepadManager.setCurrentScreen('stream');
-          suspendGamepadNavigation();
-        }
-        break;
-      }
-'''
+def once(text, find, repl, label):
+    n = text.count(find)
+    if n != 1:
+        die("radio.ts edit '%s': expected exactly 1 match, found %d." % (label, n),
+            "src/utils/radio.ts", text, (find.strip().split("\n")[0][:30],))
+    return text.replace(find, repl, 1)
 
-ITEMS = r'''
-      // RADIO
-      items.push({
-        id: 'radioMenu',
-        title: radio.isOn() ? '📻 Sim Radio (ON)' : '📻 Sim Radio',
-        active: radio.isOn(),
-      });
-      items.push({
-        id: 'toggleStreamMute',
-        title: audioGain === 0 ? '🔊 Unmute stream sound' : '🔇 Mute stream sound',
-        active: audioGain === 0,
-      });'''
+
+def patch_radio_ts():
+    p = "src/utils/radio.ts"
+    text, crlf = read(p)
+    if "from './brain'" in text:
+        print("radio.ts: already patched")
+        return
+
+    # 1. import
+    text = once(text, "import {storage} from '../store/mmkv';\n",
+                "import {storage} from '../store/mmkv';\nimport brain from './brain'; // BRAIN\n", "import")
+    # 2. constants
+    text = once(text, "const GAP_MAXS = [15, 30, 60, 120, 240];",
+                "const GAP_MAXS = [15, 30, 60, 120, 240];" + CONSTS, "constants")
+    # 3. extra talk segments that use the memory
+    text = once(text, "const SEGMENTS: Array<{t: string; nerd: boolean}> = [\n",
+                "const SEGMENTS: Array<{t: string; nerd: boolean}> = [\n" + SEGMENT_ADD, "segments")
+    # 4. fields
+    text = once(text, "  private pauseRatio = 0.4;\n", FIELDS, "fields")
+    # 5. start / stop
+    text = once(text, "    this.startedAt = Date.now();\n    this.prevFrame = '';\n",
+                "    this.startedAt = Date.now();\n    this.prevFrame = '';\n"
+                "    brain.beginSession(this.getAircraft(), this.getTrip()); // BRAIN\n"
+                "    this.startBurst();\n", "start")
+    text = once(text, "  stop() {\n    this.on = false;\n    this.run++;\n",
+                "  stop() {\n    this.on = false;\n    this.run++;\n"
+                "    this.stopBurst(); // BRAIN\n    brain.endSession();\n    brain.hideBlackout();\n", "stop")
+    # 6. burst helpers (inserted before sleep())
+    text = once(text, "  private sleep(ms: number) {", BURST_METHODS, "burst methods")
+    # 7. sharper main frame + collect the batch
+    text = once(text, "      const frame: string = await RadioModule.captureFrame(1024, 75);",
+                "      this.activeBurst = this.drainBurst(); // BRAIN\n"
+                "      const frame: string = await RadioModule.captureFrame(FRAME_W, FRAME_Q);", "main frame")
+    # 8. prompt: wording, rules, brain block, image description
+    text = once(text, "' (plus an earlier screen so you can see movement)'",
+                "' (plus a batch of earlier screenshots so you can see movement)'", "prompt wording")
+    text = once(text, "directly below this instant.';",
+                "directly below this instant.' +\n      brain.formatRules();", "prompt rules")
+    text = once(text, "      '\\nNOTEBOOK: ' + (this.getNotes() || '(empty, first transmission)') +",
+                "      brain.context() +\n      '\\nNOTEBOOK: ' + (this.getNotes() || '(empty, first transmission)') +",
+                "prompt brain block")
+    text = once(text,
+                "      (hasPrev ? '\\nThe first image is about ' + prevAge + ' seconds ago, the second is NOW.' : '\\nThe image is the screen NOW.');",
+                "      (this.burstNote || '\\nThe image is the screen NOW.');", "prompt images")
+    # 9. send the batch + a little more time for the bigger request
+    text = once(text, GENERATE_OLD, GENERATE_NEW, "generate images")
+    text = once(text, "        16000,\n", "        25000,\n", "model timeout")
+    # 10. feed the brain from every reply
+    text = once(text,
+                "        const {say, state, pause} = this.parse(await this.generate(model, key, frame));\n",
+                "        const parsed: any = this.parse(await this.generate(model, key, frame));\n"
+                "        const {say, state, pause} = parsed;\n"
+                "        try {\n          brain.ingest(parsed, this.getAircraft()); // BRAIN\n"
+                "        } catch (be) {\n          this.log('brain: ' + String(be));\n        }\n", "ingest")
+    # 11. new parser (replaces the old one)
+    a = text.find(PARSE_START)
+    b = text.find(PARSE_END)
+    if a < 0 or b < 0 or text.count(PARSE_START) != 1 or text.count(PARSE_END) != 1 or b < a:
+        die("Could not find the old parse() method to replace.", p, text, ("parse(", "SAY:"))
+    text = text[:a] + PARSE_NEW + text[b + len(PARSE_END):]
+    # 12. menu
+    text = once(text, "          {id: 'radio:tripair', title: 'Trip and aircraft'},\n", MENU_MAIN, "menu main")
+    text = once(text, "      } else if (screen === 'tripair') {\n", MENU_SCREENS, "menu screens")
+    text = once(text, "      } else if (id.startsWith('radio:nerdlvl:')) {\n", MENU_HANDLERS, "menu handlers")
+
+    write(p, text, crlf)
+    print("radio.ts: burst, hi-res frames, brain feed and menu added")
 
 
 def patch_main_application():
     p = "android/app/src/main/java/com/xstreaming/MainApplication.java"
     text, crlf = read(p)
-    if "RadioPackage" in text:
+    if "BrainPackage" in text:
         print("MainApplication.java: already patched")
         return
-    m = re.search(r"\n([ \t]*)packages\.add\(new ScreenshotPackage\(\)\);", text)
+    m = re.search(r"\n([ \t]*)packages\.add\(new com\.xstreaming\.radio\.RadioPackage\(\)\);", text)
     if not m:
-        die("Could not find 'packages.add(new ScreenshotPackage());'", p, text, ("packages.add", "Package"))
-    ins = "\n%s// RADIO\n%spackages.add(new com.xstreaming.radio.RadioPackage());" % (m.group(1), m.group(1))
+        die("Could not find the RadioPackage line (run apply_radio_patch.py first).", p, text,
+            ("packages.add", "Package"))
+    ins = "\n%s// BRAIN\n%spackages.add(new com.xstreaming.brain.BrainPackage());" % (m.group(1), m.group(1))
     text = text[: m.end()] + ins + text[m.end():]
     write(p, text, crlf)
-    print("MainApplication.java: RadioPackage registered")
-
-
-def patch_native_stream():
-    p = "src/pages/NativeStream.tsx"
-    text, crlf = read(p)
-    if "RADIO" in text:
-        print("NativeStream.tsx: already patched")
-        return
-    kw = ("takeScreenshot", "screenshot", "isRecording")
-
-    # 1. import
-    anchor = "import screenshot from '../utils/screenshot';"
-    if text.count(anchor) != 1:
-        die("Expected exactly one screenshot import line.", p, text, kw)
-    text = text.replace(anchor, anchor + "\nimport radio from '../utils/radio'; // RADIO")
-
-    # 2. unmount cleanup
-    anchor = "  const [isRecording, setIsRecording] = React.useState(false);\n"
-    if text.count(anchor) != 1:
-        die("Expected exactly one isRecording useState line.", p, text, kw)
-    text = text.replace(
-        anchor,
-        anchor + "\n  // RADIO: stop the radio when leaving the stream screen\n  const muteRestoreGainRef = React.useRef(1);\n  React.useEffect(() => {\n    return () => {\n      radio.stop();\n    };\n  }, []);\n",
-    )
-
-    # 3. menu items (after the Take Screenshot item)
-    pat = re.compile(r"(      items\.push\(\{\s*id: 'takeScreenshot',\s*title: t\('Take Screenshot'\),\s*\}\);)")
-    ms = list(pat.finditer(text))
-    if len(ms) != 1:
-        die("Expected exactly one 'takeScreenshot' menu item, found %d." % len(ms), p, text, kw)
-    text = text[: ms[0].end()] + ITEMS + text[ms[0].end():]
-
-    # 3b. add handleAudioGainChange to the menu callback's dependency list
-    dep = "    audioGain,\n    connectState,\n    handleCloseModal,\n"
-    if text.count(dep) != 1:
-        die("Could not find the menu callback dependency list.", p, text, ("audioGain", "connectState"))
-    text = text.replace(dep, "    audioGain,\n    handleAudioGainChange,\n    connectState,\n    handleCloseModal,\n")
-
-    # 4. switch cases (before case 'takeScreenshot')
-    anchor = "      case 'takeScreenshot': {"
-    if text.count(anchor) != 1:
-        die("Expected exactly one case 'takeScreenshot'.", p, text, kw)
-    text = text.replace(anchor, CASES + anchor)
-
-    write(p, text, crlf)
-    print("NativeStream.tsx: radio menu + cases added")
+    print("MainApplication.java: BrainPackage registered")
 
 
 def main():
     if not pathlib.Path("package.json").exists():
         die("Run this from the repo root (package.json not found).")
-    write(JAVA_DIR + "/RadioModule.java", RADIO_MODULE)
-    write(JAVA_DIR + "/RadioPackage.java", RADIO_PACKAGE)
+    if not pathlib.Path("src/utils/radio.ts").exists():
+        die("src/utils/radio.ts not found. Run apply_radio_patch.py first.")
+    write(JAVA_DIR + "/BrainModule.java", BRAIN_MODULE)
+    write(JAVA_DIR + "/BrainPackage.java", BRAIN_PACKAGE)
     print("wrote Java classes")
-    write("src/utils/radio.ts", RADIO_TS)
-    print("wrote src/utils/radio.ts")
+    write("src/utils/brain.ts", BRAIN_TS)
+    print("wrote src/utils/brain.ts")
+    write("docs/brain-further-plans.md", FURTHER_PLANS)
+    print("wrote docs/brain-further-plans.md")
     patch_main_application()
-    patch_native_stream()
-    print("\nRADIO patch OK")
+    patch_radio_ts()
+    print("\nBRAIN patch OK")
 
 
-main()
+if __name__ == "__main__":
+    main()
