@@ -37,8 +37,8 @@ jobs:
       - name: Apply Sim Radio patch
         run: python3 .github/apply_radio_patch.py
 
-      - name: Apply Cabin Crew patch
-        run: python3 .github/apply_crew_patch.py
+      - name: Apply Cabin Crew fixes and wiring
+        run: python3 .github/apply_cabin_fix_patch.py
 
       - name: Save a diff of everything the patches changed
         if: always()
