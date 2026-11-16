@@ -1390,3 +1390,16 @@ def main():
 
 
 main()
+
+# BRAIN: run the brain patch straight after the radio patch, so the existing workflow needs no extra step.
+# (Safe if the workflow also has its own brain step: the brain patch skips what is already applied.)
+import os
+import subprocess
+
+_brain = os.path.join(os.path.dirname(os.path.abspath(__file__)), "apply_brain_patch.py")
+if os.path.exists(_brain):
+    print("\nRunning apply_brain_patch.py ...")
+    sys.stdout.flush()
+    subprocess.check_call([sys.executable, _brain])
+else:
+    print("\nNOTE: apply_brain_patch.py not found next to this file, brain features NOT applied.")
