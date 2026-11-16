@@ -1457,11 +1457,15 @@ MENU_SCREENS = r"""      } else if (screen === 'brain') {
           {id: 'radio:back', title: 'Back'},
         ];
       } else if (screen === 'keys') {
-        items = KEY_SLOTS.map(s => ({
-          id: 'radio:slot:' + s.id,
-          title: 'Key ' + s.id + ': ' + s.name + (this.getSlotKey(s.id) ? ' [set]' : ' [empty]'),
-        }));
-        items.push({id: 'radio:more', title: 'Back'});
+        items = [
+          {id: 'radio:key', title: 'Default key (used by any model without its own): ' + (this.getMainKey() ? '[set]' : '[empty]')},
+        ].concat(
+          KEY_SLOTS.map(s => ({
+            id: 'radio:slot:' + s.id,
+            title: 'Key ' + s.id + ': ' + s.name + (this.getSlotKey(s.id) ? ' [set]' : ' [empty]'),
+          })),
+        );
+        items.push({id: 'radio:back', title: 'Back'});
       } else if (screen === 'logbook') {
         items = brain.logbookItems();
         items.push({id: 'radio:brain', title: 'Back'});
@@ -1714,6 +1718,8 @@ def patch_radio_ts():
                 "follow the LENGTH line of each turn (never fewer than 15 words, never padded: even a short line is a complete thought with something specific in it). ", "length rule")
     text = once(text, "      '\\nSEGMENT FOR THIS TURN: ' + this.pickSegment() +\n",
                 "      '\\nLENGTH FOR THIS TURN: ' + this.pickLength() +\n      '\\nSEGMENT FOR THIS TURN: ' + this.pickSegment() +\n", "length line")
+    text = once(text, "          {id: 'radio:now', title: 'Talk now'},\n",
+                "          {id: 'radio:now', title: 'Talk now'},\n          {id: 'radio:keys', title: 'API keys (' + (KEY_SLOTS.filter(s => this.getSlotKey(s.id)).length + (this.getMainKey() ? 1 : 0)) + ' of ' + (KEY_SLOTS.length + 1) + ' set)'},\n", "main menu keys entry")
 
     write(p, text, crlf)
     print("radio.ts: burst, hi-res frames, brain feed and menu added")
