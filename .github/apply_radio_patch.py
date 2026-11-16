@@ -382,18 +382,15 @@ import {storage} from '../store/mmkv';
 
 const {RadioModule} = NativeModules;
 
-// Vision/brain models, best -> worst. Unavailable / capped / timing out => next one.
+// Vision/brain models, best -> worst (free-tier ones only; Argon/Carbon are paid). Unavailable / capped / timing out => next one.
 export const MODEL_CHAIN = [
-  'gemini-3.8-flash',
-  'gemini-3.7-flash',
-  'gemini-3.6-flash',
-  'gemini-3.5-flash',
+  'gemini-4-hydrogen',
   'gemini-3.5-flash-lite',
+  'gemini-flash-latest',
+  'gemini-flash-lite-latest',
   'gemini-3.1-flash-lite',
   'gemini-2.5-flash',
   'gemini-2.5-flash-lite',
-  'gemini-flash-latest',
-  'gemini-flash-lite-latest',
 ];
 
 // Natural-voice (speech) models, best -> worst. If all fail the phone's own voice is used.
@@ -418,11 +415,14 @@ export const SPEAKERS: Array<{id: string; name: string}> = [
 const API = 'https://generativelanguage.googleapis.com/v1beta';
 const K_API = 'radio_api_key';
 const K_PERSONA = 'radio_persona';
-const K_INTERVAL = 'radio_interval';
+const K_GAP_MIN = 'radio_gap_min';
+const K_GAP_MAX = 'radio_gap_max';
 const K_CAPTIONS = 'radio_captions';
 const K_SPEAKER = 'radio_speaker';
 const K_TRIP = 'radio_trip';
 const K_NOTES = 'radio_notebook';
+const K_NERD = 'radio_nerd';
+const K_AIRCRAFT = 'radio_aircraft';
 
 export const PERSONAS: Array<{id: string; name: string; prompt: string; style: string}> = [
   {
@@ -431,7 +431,7 @@ export const PERSONAS: Array<{id: string; name: string; prompt: string; style: s
     style:
       'Speak like a warm, slightly gravelly, relaxed late-night radio host with dry humour, natural pacing and small pauses',
     prompt:
-      'You are the host of "Bush Radio", a late-night station for a pilot flying a small bush plane around the world. You are warm, dry-witted, curious and a little cheeky, and you love local stories, geography, wildlife and aviation history. You are talking to ONE listener, the pilot, like an old friend.',
+      'You are the host of "Bush Radio", a late-night station for a pilot flying around the world. You are warm, dry-witted, curious and a little cheeky, and you love local stories, geography, wildlife and aviation history. You are talking to ONE listener, the pilot, like an old friend.',
   },
   {
     id: 'storyteller',
@@ -477,18 +477,39 @@ export const PERSONAS: Array<{id: string; name: string; prompt: string; style: s
   },
 ];
 
-const SEGMENTS = [
-  'name the exact landmark, town, river, mountain or airfield below or ahead and give ONE surprising fact about it',
-  'tell a short true piece of local history or a human story tied to this area',
-  'colour about the wildlife, terrain, climate or weather typical of this exact region and altitude',
-  'react to the latest ATC subtitle or what the pilot is doing right now, with personality',
-  'trip progress: where we came from, where we are heading, what comes next on the route',
-  'a quick funny observation or bit of banter based on something visible on screen',
-  'tell the listener what to look out for in the next few minutes of flight',
-  'a short legend or story connected to a place we have just passed',
+const SEGMENTS: Array<{t: string; nerd: boolean}> = [
+  {t: 'name the exact landmark, town, river, mountain or airfield below or ahead and give ONE surprising fact about it', nerd: false},
+  {t: 'tell a short true piece of local history or a human story tied to this area', nerd: false},
+  {t: 'colour about the wildlife, terrain, climate or weather typical of this exact region and altitude', nerd: false},
+  {t: 'react to the latest ATC subtitle or what the pilot is doing right now, with personality', nerd: false},
+  {t: 'trip progress: where we came from, where we are heading, what comes next on the route', nerd: false},
+  {t: 'a quick funny observation or bit of banter based on something visible on screen', nerd: false},
+  {t: 'tell the listener what to look out for in the next few minutes of flight', nerd: false},
+  {t: 'a short legend or story connected to a place we have just passed', nerd: false},
+  {t: 'recommend ONE real song (title and artist, never quote lyrics) that suits this place, this time of day or this mood of flying, and say why in a sentence or two', nerd: false},
+  {t: 'a nerdy aside about how THIS aircraft works or flies (aerodynamics, lift, engine, instruments, handling quirks of its actual type) explained so it is genuinely fun', nerd: true},
+  {t: 'a nerdy geography, geology, map or place-name fact about this region (why it looks like this, how it formed, why it is called that)', nerd: true},
+  {t: 'a bit of aviation, space or engineering history that connects to somewhere near this route', nerd: true},
+  {t: 'a fun "did you know" or a tiny trivia question to the pilot that you then answer yourself after a beat', nerd: true},
+  {t: 'chat the way real radio hosts do: a light opinion, a "what would you do" question to the pilot, or a thought about flying at this time of day', nerd: false},
+  {t: 'a nerdy tangent from physics, astronomy, language or technology that this view reminds you of', nerd: true},
 ];
 
-const INTERVALS = [10, 15, 30, 60, 120];
+const NERD_LEVELS: Array<{id: number; name: string; weight: number; directive: string}> = [
+  {id: 1, name: '1 - Casual (stories, banter, no science)', weight: 0,
+    directive: 'Keep it light and plain: stories, places, people, banter and music. No technical explanations or jargon at all.'},
+  {id: 2, name: '2 - A little nerdy', weight: 0.35,
+    directive: 'Mostly everyday talk. Now and then one simple, friendly science or tech fact, explained in a sentence.'},
+  {id: 3, name: '3 - Nerdy (default)', weight: 1,
+    directive: 'Nerdy but friendly: enjoy explaining how things work, with one clear, surprising fact at a time and a short "here is why".'},
+  {id: 4, name: '4 - Properly nerdy', weight: 2,
+    directive: 'Properly nerdy: go a layer deeper than most people would. Name the mechanism or effect, give real numbers, and add the history of the idea, always explained clearly so a curious person follows it.'},
+  {id: 5, name: '5 - Full professor', weight: 3.5,
+    directive: 'Full nerd: expert-level tangents, precise terminology (defined in passing), real figures, and surprising connections between fields. The listener loves rabbit holes. Still talk like a person on the radio, never like a lecture.'},
+];
+
+const GAP_MINS = [2, 4, 8, 15, 30];
+const GAP_MAXS = [15, 30, 60, 120, 240];
 
 class ApiError extends Error {
   status: number;
@@ -522,6 +543,10 @@ class SimRadio {
   private prevFrameAt = 0;
   private lastSegment = -1;
   private startedAt = 0;
+  private run = 0;
+  private latencyEma = 9000;
+  private thinkMode: Record<string, number> = {};
+  private pauseRatio = 0.4;
 
   // ---------- settings ----------
   getApiKey(): string {
@@ -536,11 +561,17 @@ class SimRadio {
   setPersonaId(id: string) {
     storage.set(K_PERSONA, id);
   }
-  getInterval(): number {
-    return storage.getNumber(K_INTERVAL) || 15;
+  getGapMin(): number {
+    return storage.getNumber(K_GAP_MIN) || 4;
   }
-  setInterval(s: number) {
-    storage.set(K_INTERVAL, s);
+  getGapMax(): number {
+    return Math.max(storage.getNumber(K_GAP_MAX) || 40, this.getGapMin());
+  }
+  setGapMin(s: number) {
+    storage.set(K_GAP_MIN, s);
+  }
+  setGapMax(s: number) {
+    storage.set(K_GAP_MAX, s);
   }
   getCaptions(): boolean {
     const v = storage.getBoolean(K_CAPTIONS);
@@ -567,6 +598,19 @@ class SimRadio {
   setNotes(s: string) {
     storage.set(K_NOTES, (s || '').slice(0, 900));
   }
+  getNerd(): number {
+    const v = storage.getNumber(K_NERD);
+    return v && v >= 1 && v <= 5 ? v : 3;
+  }
+  setNerd(n: number) {
+    storage.set(K_NERD, n);
+  }
+  getAircraft(): string {
+    return storage.getString(K_AIRCRAFT) || '';
+  }
+  setAircraft(s: string) {
+    storage.set(K_AIRCRAFT, (s || '').trim());
+  }
   isOn() {
     return this.on;
   }
@@ -579,36 +623,35 @@ class SimRadio {
     this.on = true;
     this.startedAt = Date.now();
     this.prevFrame = '';
-    this.schedule(2500);
+    const id = ++this.run;
+    this.loop(id);
   }
 
   stop() {
     this.on = false;
-    if (this.timer) {
-      clearTimeout(this.timer);
-      this.timer = null;
-    }
+    this.run++;
     try {
       RadioModule?.stopSpeaking?.();
     } catch (e) {}
   }
 
-  private schedule(ms: number) {
-    if (!this.on) {
+  async talkNow() {
+    try {
+      RadioModule?.stopSpeaking?.();
+    } catch (e) {}
+    const id = ++this.run;
+    if (this.on) {
+      this.loop(id);
       return;
     }
-    if (this.timer) {
-      clearTimeout(this.timer);
+    const p = await this.produce(id);
+    if (p) {
+      await this.play(p, id);
     }
-    this.timer = setTimeout(() => this.tick(false), ms);
   }
 
-  async talkNow() {
-    if (this.timer) {
-      clearTimeout(this.timer);
-      this.timer = null;
-    }
-    await this.tick(true);
+  private sleep(ms: number) {
+    return new Promise<void>(res => setTimeout(res, Math.max(0, ms)));
   }
 
   private log(m: string) {
@@ -617,34 +660,104 @@ class SimRadio {
     } catch (e) {}
   }
 
-  private async tick(force: boolean) {
-    if ((!this.on && !force) || this.busy) {
-      return;
+  // The next line is looked at, written and voiced WHILE the current one is still playing, timed so
+  // it is ready the moment the pause after the current line ends. A fresh screenshot is taken
+  // then, so a long line simply delays the next screenshot (dynamic timing).
+  private async loop(id: number) {
+    let next: Promise<any> = this.produce(id);
+    while (this.on && this.run === id) {
+      const prepared = await next;
+      if (!this.on || this.run !== id) {
+        return;
+      }
+      if (!prepared) {
+        await this.sleep(Math.min(15000, Math.max(3000, this.getGapMin() * 1000)));
+        next = this.produce(id);
+        continue;
+      }
+      const gap = prepared.pause;
+      const lead = Math.min(30000, Math.max(5000, this.latencyEma + 2000));
+      const startNextIn = Math.max(0, prepared.ms + gap - lead);
+      next = this.sleep(startNextIn).then(() =>
+        this.on && this.run === id ? this.produce(id) : null,
+      );
+      await this.play(prepared, id);
+      if (!this.on || this.run !== id) {
+        return;
+      }
+      await this.sleep(gap);
     }
-    this.busy = true;
+  }
+
+  private async produce(id: number): Promise<any> {
+    const t0 = Date.now();
     try {
       const frame: string = await RadioModule.captureFrame(1024, 75);
       const text = await this.ask(frame);
       this.prevFrame = frame;
       this.prevFrameAt = Date.now();
-      this.log('model=' + this.lastModel + ' said=' + (text || '(skip)'));
-      if (text && (this.on || force)) {
-        this.history.push(text);
-        if (this.history.length > 8) {
-          this.history.shift();
-        }
-        if (this.getCaptions()) {
-          toast('📻 ' + text);
-        }
-        RadioModule?.click?.();
-        await this.say(text);
+      if (!text) {
+        this.log('model=' + this.lastModel + ' said=(skip)');
+        return null;
       }
+      if (this.run !== id) {
+        return null;
+      }
+      this.history.push(text);
+      if (this.history.length > 8) {
+        this.history.shift();
+      }
+      let audio: any = null;
+      if (this.getSpeaker() !== 'Phone voice') {
+        audio = await this.fetchGeminiAudio(text);
+      }
+      const words = text.split(/\s+/).length;
+      const ms = audio ? audio.ms : Math.round((words / 2.6) * 1000);
+      // dynamic pause: the model suggests short/medium/long, nudged by how long the line was, plus jitter
+      const pmin = this.getGapMin() * 1000;
+      const pmax = Math.max(pmin, this.getGapMax() * 1000);
+      let ratio = this.pauseRatio + (ms > 40000 ? 0.15 : ms < 8000 ? -0.1 : 0) + (Math.random() - 0.5) * 0.2;
+      ratio = Math.min(1, Math.max(0, ratio));
+      const pause = Math.round(pmin + (pmax - pmin) * ratio);
+      const lat = Date.now() - t0;
+      this.latencyEma = Math.round(this.latencyEma * 0.6 + lat * 0.4);
+      this.log(
+        'model=' + this.lastModel + ' voice=' + (audio ? this.lastVoice : 'phone') +
+          ' prep=' + lat + 'ms speech=' + ms + 'ms pause=' + pause + 'ms said=' + text,
+      );
+      return {text, audio, ms, pause};
     } catch (e: any) {
       this.noteError(e);
-    } finally {
-      this.busy = false;
-      this.schedule(this.getInterval() * 1000);
+      return null;
     }
+  }
+
+  private async play(p: any, id: number) {
+    if (this.run !== id) {
+      return;
+    }
+    if (this.getCaptions()) {
+      toast('📻 ' + p.text);
+    }
+    RadioModule?.click?.();
+    if (p.audio) {
+      const t0 = Date.now();
+      let ok = false;
+      try {
+        ok = await RadioModule.playPcm(p.audio.data, p.audio.rate);
+      } catch (e) {}
+      // phone voice only if the Gemini audio failed to start at all (never over audio that played)
+      if (ok || Date.now() - t0 > 1500 || this.run !== id) {
+        return;
+      }
+    }
+    await Promise.race([
+      RadioModule?.speak?.(p.text, 1.0, 0.92),
+      this.sleep(p.ms * 1.6 + 15000).then(() => {
+        RadioModule?.stopSpeaking?.();
+        return false;
+      }),
+    ]);
   }
 
   private noteError(e: any) {
@@ -662,41 +775,19 @@ class SimRadio {
   }
 
   // ---------- speaking ----------
-  private async say(text: string) {
-    let spoken = false;
-    if (this.getSpeaker() !== 'Phone voice') {
-      try {
-        spoken = await Promise.race([
-          this.speakGemini(text),
-          new Promise<boolean>(res => setTimeout(() => res(false), 45000)),
-        ]);
-      } catch (e: any) {
-        this.log('gemini voice failed: ' + String(e?.message || e));
-      }
-    }
-    if (!spoken) {
-      await Promise.race([
-        RadioModule?.speak?.(text, 1.0, 0.92),
-        new Promise(res =>
-          setTimeout(() => {
-            RadioModule?.stopSpeaking?.();
-            res(false);
-          }, 30000),
-        ),
-      ]);
-    }
-  }
-
   private ttsCandidates(): string[] {
     const now = Date.now();
     let list = TTS_CHAIN.slice();
     if (this.available) {
-      const have = TTS_CHAIN.filter(m => this.available!.includes(m));
-      const extra = this.available
-        .filter(m => /tts/i.test(m) && !TTS_CHAIN.includes(m))
-        .sort()
-        .reverse();
-      list = have.concat(extra);
+      const all = this.available.filter(m => /tts/i.test(m) && !/argon|carbon/i.test(m));
+      const rank = (m: string) => {
+        if (/hydrogen/i.test(m)) {
+          return -1;
+        }
+        const i = TTS_CHAIN.indexOf(m);
+        return i >= 0 ? i : 50;
+      };
+      list = all.sort((x, y) => rank(x) - rank(y));
       if (list.length === 0) {
         list = TTS_CHAIN.slice();
       }
@@ -704,9 +795,8 @@ class SimRadio {
     return list.filter(m => (this.cooldown[m] || 0) <= now);
   }
 
-  private async speakGemini(text: string): Promise<boolean> {
+  private async fetchGeminiAudio(text: string): Promise<any> {
     const key = this.getApiKey();
-    const persona = PERSONAS.find(p => p.id === this.getPersonaId()) || PERSONAS[0];
     for (const model of this.ttsCandidates()) {
       try {
         const r = await this.timedFetch(
@@ -715,7 +805,7 @@ class SimRadio {
             method: 'POST',
             headers: {'Content-Type': 'application/json', 'x-goog-api-key': key},
             body: JSON.stringify({
-              contents: [{parts: [{text: persona.style + ': ' + text}]}],
+              contents: [{parts: [{text}]}],
               generationConfig: {
                 responseModalities: ['AUDIO'],
                 speechConfig: {
@@ -724,7 +814,7 @@ class SimRadio {
               },
             }),
           },
-          25000,
+          30000,
         );
         const raw = await r.text();
         if (!r.ok) {
@@ -739,19 +829,19 @@ class SimRadio {
         }
         const mime: string = String(inl.mimeType || inl.mime_type || '');
         const rate = parseInt((mime.match(/rate=(\d+)/) || [])[1] || '24000', 10);
-        const ok = await RadioModule.playPcm(inl.data, rate);
+        const bytes = Math.floor((String(inl.data).length * 3) / 4);
         this.lastVoice = model;
-        return !!ok;
+        return {data: inl.data, rate, ms: Math.round((bytes / 2 / rate) * 1000)};
       } catch (e: any) {
         if (e instanceof ApiError) {
           this.setCooldown(model, e);
         } else {
-          this.cooldown[model] = Date.now() + 90 * 1000;
+          this.cooldown[model] = Date.now() + 3 * 60 * 1000;
         }
         this.log('voice fallback from ' + model + ': ' + String(e?.message || e));
       }
     }
-    return false;
+    return null;
   }
 
   // ---------- Gemini (brain) ----------
@@ -789,15 +879,21 @@ class SimRadio {
 
   private candidates(): string[] {
     const now = Date.now();
+    const hydro = (this.available || []).filter(
+      m => /hydrogen/i.test(m) && !/tts|image|live|audio|embed|robot/i.test(m),
+    );
     const base = this.available ? MODEL_CHAIN.filter(m => this.available!.includes(m)) : MODEL_CHAIN;
-    const list = base.length > 0 ? base : MODEL_CHAIN;
+    const merged = hydro.concat(base.filter(m => !hydro.includes(m)));
+    const list = merged.length > 0 ? merged : MODEL_CHAIN;
     return list.filter(m => (this.cooldown[m] || 0) <= now);
   }
 
   private setCooldown(model: string, e: ApiError) {
     const b = e.body || '';
-    let ms = 60 * 1000;
-    if (e.status === 429) {
+    let ms = 3 * 60 * 1000;
+    if (e.status === 503 || e.status === 500 || e.status === 504) {
+      ms = 5 * 60 * 1000;
+    } else if (e.status === 429) {
       ms = /PerDay|per day|daily/i.test(b) ? 6 * 3600 * 1000 : 10 * 60 * 1000;
     } else if (e.status === 404 || e.status === 400) {
       ms = 6 * 3600 * 1000;
@@ -808,12 +904,20 @@ class SimRadio {
   }
 
   private pickSegment(): string {
-    let i = Math.floor(Math.random() * SEGMENTS.length);
-    if (i === this.lastSegment) {
-      i = (i + 1) % SEGMENTS.length;
+    const level = NERD_LEVELS.find(n => n.id === this.getNerd()) || NERD_LEVELS[2];
+    const weights = SEGMENTS.map((s, i) => (i === this.lastSegment ? 0 : s.nerd ? level.weight : 1));
+    const total = weights.reduce((x, y) => x + y, 0);
+    let r = Math.random() * total;
+    let pick = 0;
+    for (let i = 0; i < weights.length; i++) {
+      r -= weights[i];
+      if (r <= 0) {
+        pick = i;
+        break;
+      }
     }
-    this.lastSegment = i;
-    return SEGMENTS[i];
+    this.lastSegment = pick;
+    return SEGMENTS[pick].t;
   }
 
   private buildPrompt(hasPrev: boolean): {system: string; user: string} {
@@ -823,16 +927,23 @@ class SimRadio {
       '\n\nYou are both the brain and the voice of the show. Each turn you get the current screen from the game stream' +
       (hasPrev ? ' (plus an earlier screen so you can see movement)' : '') +
       ', the trip brief, your running notebook and your recent lines.' +
+      '\nAIRCRAFT RULE: the aircraft can change from flight to flight. Never assume a type. Identify it from the AIRCRAFT and TRIP BRIEF lines and from anything visible (HUD, instrument panel, aircraft name or registration, ATC callsign). If the screen contradicts the brief, trust the screen and carry the correct type in your notebook. If you genuinely cannot tell, say "the aircraft" without naming a type. Keep any technical or handling talk true to the actual aircraft.' +
       '\nREAD ALL ON-SCREEN TEXT carefully: HUD and instrument readouts, map, place-name and UI banners, waypoint and airport identifiers, ATC subtitles and callsigns. From these, work out exactly where the aircraft is and what is below, ahead and nearby, then use your world knowledge to talk about the REAL place: its landmarks, rivers, towns, mountains, history, wildlife and culture. If you cannot justify a place from the screen or notebook, hedge once ("looks like...") instead of inventing.' +
       '\nReply in EXACTLY this format:' +
-      '\nSTATE: <60 words max. Updated notebook: where we are (place names, airfield, region), heading/altitude/phase of flight, landmarks passed, next expected landmark or waypoint, anything the pilot is doing. Keep useful facts from the old notebook.>' +
+      '\nSTATE: <60 words max. Updated notebook: where we are (place names, airfield, region), the aircraft type if known, heading/altitude/phase of flight, landmarks passed, next expected landmark or waypoint, anything the pilot is doing, and any destination you have suggested. Keep useful facts from the old notebook.>' +
       '\nSAY: <the words to speak aloud>' +
-      '\nSAY rules: 45 to 75 words, conversational, specific and concrete with named places and facts, varied rhythm, no lists, no emojis, no markdown, no stage directions. Never merely describe the picture: every line must carry a specific name, fact, story or reaction to an ATC call. Never repeat or rephrase your earlier lines. If the screen is only a loading screen, black or an unchanged menu, write SAY: SKIP';
+      '\nPAUSE: <short | medium | long: how long to leave before you speak again. short = a quick follow-up thought or reaction, medium = normal, long = after a big story, or when the pilot is busy (takeoff, landing, heavy ATC traffic) or just let them enjoy the view>' +
+      '\nBORING SCENERY RULE: if the view is empty or featureless (open desert, endless fields, open sea, thick cloud, nothing to point at), do NOT waffle about sand or emptiness. Pivot: recommend somewhere genuinely worth flying to from the current position (a famous landmark, scenic coastline, interesting airport, canyon, city skyline or unusual place), with the rough compass direction, distance and flying time and one reason it is great. Make it a real suggestion the pilot can act on. If the notebook shows you suggested a destination and the pilot now seems to be heading that way, notice it and get excited about it. Never suggest places you are not sure exist.' +
+      '\nCONVERSATION RULE: you are a good radio host, not a tour-guide script. Mix place facts with natural talk: song recommendations (title and artist only, never lyrics), asides about science, engineering, aviation, geography or language that a curious person would love (as far as the NERD LEVEL allows), light opinions and questions to the pilot. The NERD LEVEL line each turn says how technical to get. Be correct: if unsure of a fact, leave it out.' +
+      '\nSAY rules: length follows what you have to say: sometimes one punchy sentence (15 words), usually 40 to 90 words, and occasionally a proper story up to 150 words (about a minute spoken). Write for the ear like a real broadcaster: contractions, short sentences mixed with longer ones, dashes and ellipses for natural pauses, spoken numbers ("nine hundred feet"). Specific and concrete with named places and facts. No lists, no emojis, no markdown, no stage directions, never mention instructions or tone. Never merely describe the picture: every line must carry a specific name, fact, story or reaction to an ATC call. Never repeat or rephrase your earlier lines. If the screen is only a loading screen, black or an unchanged menu, write SAY: SKIP' +
+      '\nTIMING: the listener hears your line roughly ' + Math.round(this.latencyEma / 1000 + (this.getGapMin() + this.getGapMax()) / 4 + 4) + ' seconds after this screenshot, so favour what is coming up ahead and what we have just passed over what is directly below this instant.';
     const recent = this.history.slice(-6);
     const mins = this.startedAt ? Math.round((Date.now() - this.startedAt) / 60000) : 0;
     const prevAge = this.prevFrameAt ? Math.round((Date.now() - this.prevFrameAt) / 1000) : 0;
     const user =
-      'TRIP BRIEF: ' + (this.getTrip() || '(none given; work it out from the screen)') +
+      'AIRCRAFT: ' + (this.getAircraft() || '(not set: work it out from the trip brief or the screen)') +
+      '\nTRIP BRIEF: ' + (this.getTrip() || '(none given; work it out from the screen)') +
+      '\nNERD LEVEL ' + this.getNerd() + ' of 5: ' + ((NERD_LEVELS.find(n => n.id === this.getNerd()) || NERD_LEVELS[2]).directive) +
       '\nNOTEBOOK: ' + (this.getNotes() || '(empty, first transmission)') +
       '\nON AIR FOR: ' + mins + ' min' +
       (recent.length ? '\nYOUR RECENT LINES (do not repeat): ' + recent.map(h => '"' + h + '"').join(' | ') : '') +
@@ -849,40 +960,54 @@ class SimRadio {
       parts.push({inline_data: {mime_type: 'image/jpeg', data: this.prevFrame}});
     }
     parts.push({inline_data: {mime_type: 'image/jpeg', data: frame}});
-    const r = await this.timedFetch(
-      API + '/models/' + model + ':generateContent',
-      {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json', 'x-goog-api-key': key},
-        body: JSON.stringify({
-          systemInstruction: {parts: [{text: system}]},
-          contents: [{role: 'user', parts}],
-          generationConfig: {temperature: 1.0, maxOutputTokens: 2048},
-        }),
-      },
-      25000,
-    );
-    const raw = await r.text();
-    if (!r.ok) {
-      throw new ApiError(r.status, raw);
+    // keep "thinking" minimal for speed; fall back through the config styles different generations accept
+    const modes: any[] = [{thinkingBudget: 0}, {thinkingLevel: 'low'}, null];
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const mode = Math.min(this.thinkMode[model] || 0, 2);
+      const cfg: any = {temperature: 1.0, maxOutputTokens: 2048};
+      if (modes[mode]) {
+        cfg.thinkingConfig = modes[mode];
+      }
+      const r = await this.timedFetch(
+        API + '/models/' + model + ':generateContent',
+        {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json', 'x-goog-api-key': key},
+          body: JSON.stringify({
+            systemInstruction: {parts: [{text: system}]},
+            contents: [{role: 'user', parts}],
+            generationConfig: cfg,
+          }),
+        },
+        16000,
+      );
+      const raw = await r.text();
+      if (!r.ok) {
+        if (r.status === 400 && /think/i.test(raw) && mode < 2) {
+          this.thinkMode[model] = mode + 1;
+          continue;
+        }
+        throw new ApiError(r.status, raw);
+      }
+      let j: any = {};
+      try {
+        j = JSON.parse(raw);
+      } catch (e) {}
+      if (j?.promptFeedback?.blockReason) {
+        return 'STATE:\nSAY: SKIP';
+      }
+      const ps: any[] = j?.candidates?.[0]?.content?.parts || [];
+      const text = ps
+        .filter(p => typeof p?.text === 'string' && !p.thought)
+        .map(p => p.text)
+        .join(' ')
+        .trim();
+      if (!text) {
+        throw new ApiError(0, 'empty reply (' + (j?.candidates?.[0]?.finishReason || '?') + ')');
+      }
+      return text;
     }
-    let j: any = {};
-    try {
-      j = JSON.parse(raw);
-    } catch (e) {}
-    if (j?.promptFeedback?.blockReason) {
-      return 'STATE:\nSAY: SKIP';
-    }
-    const ps: any[] = j?.candidates?.[0]?.content?.parts || [];
-    const text = ps
-      .filter(p => typeof p?.text === 'string' && !p.thought)
-      .map(p => p.text)
-      .join(' ')
-      .trim();
-    if (!text) {
-      throw new ApiError(0, 'empty reply (' + (j?.candidates?.[0]?.finishReason || '?') + ')');
-    }
-    return text;
+    throw new ApiError(0, 'thinking config rejected');
   }
 
   private clean(t: string) {
@@ -892,12 +1017,16 @@ class SimRadio {
       .trim();
   }
 
-  private parse(out: string): {say: string; state: string} {
-    const m = out.match(/STATE:\s*([\s\S]*?)\s*SAY:\s*([\s\S]*)$/i);
+  private parse(out: string): {say: string; state: string; pause: number} {
+    const m = out.match(/STATE:\s*([\s\S]*?)\s*SAY:\s*([\s\S]*?)(?:\s*PAUSE:\s*(\w+))?\s*$/i);
+    const pr = (w?: string) => {
+      const k = String(w || '').toLowerCase();
+      return k === 'short' ? 0.08 : k === 'long' ? 0.92 : 0.45;
+    };
     if (m) {
-      return {state: this.clean(m[1]), say: this.clean(m[2])};
+      return {state: this.clean(m[1]), say: this.clean(m[2]), pause: pr(m[3])};
     }
-    return {state: '', say: this.clean(out.replace(/^SAY:\s*/i, ''))};
+    return {state: '', say: this.clean(out.replace(/^SAY:\s*/i, '')), pause: 0.45};
   }
 
   private async ask(frame: string): Promise<string> {
@@ -910,7 +1039,8 @@ class SimRadio {
     for (const model of this.candidates()) {
       tried++;
       try {
-        const {say, state} = this.parse(await this.generate(model, key, frame));
+        const {say, state, pause} = this.parse(await this.generate(model, key, frame));
+        this.pauseRatio = pause;
         this.lastModel = model;
         this.lastError = '';
         if (state) {
@@ -928,7 +1058,7 @@ class SimRadio {
           this.setCooldown(model, e);
           this.lastError = model + ': ' + e.message;
         } else {
-          this.cooldown[model] = Date.now() + 90 * 1000;
+          this.cooldown[model] = Date.now() + 3 * 60 * 1000;
           this.lastError = model + ': ' + (e?.name === 'AbortError' ? 'timeout' : String(e?.message || e));
         }
         this.log('fallback from ' + model + ' -> ' + this.lastError);
@@ -946,7 +1076,7 @@ class SimRadio {
     return (
       (this.on ? 'ON' : 'OFF') +
       ' | brain: ' + (this.lastModel || 'none yet') +
-      ' | voice: ' + (this.getSpeaker() === 'Phone voice' ? 'phone' : this.lastVoice || 'none yet') +
+      ' | prep ' + Math.round(this.latencyEma / 1000) + 's | voice: ' + (this.getSpeaker() === 'Phone voice' ? 'phone' : this.lastVoice || 'none yet') +
       (capped.length ? ' | capped: ' + capped.join(', ') : '') +
       (this.lastError ? ' | last error: ' + this.lastError.slice(0, 140) : '')
     );
@@ -974,8 +1104,8 @@ class SimRadio {
   async promptForTrip(showInput: (o: any) => Promise<any>) {
     const r = await showInput({
       title: 'Trip brief',
-      message: 'Who/what/where: aircraft, route, legs, stops, goals. The radio uses this every time.',
-      hint: 'e.g. Bonanza G36 world tour, FALA loop, leg 3: FALA to FACT',
+      message: 'Route, legs, stops, goals, what you are up to today. The radio uses this every time. (The aircraft has its own setting.)',
+      hint: 'e.g. world tour, leg 3 of 12, sightseeing around the coast',
       text: this.getTrip(),
       maxLength: 500,
       confirmText: 'Save',
@@ -987,6 +1117,22 @@ class SimRadio {
     }
   }
 
+  async promptForAircraft(showInput: (o: any) => Promise<any>) {
+    const r = await showInput({
+      title: 'Aircraft',
+      message: 'What you are flying right now. Leave empty to let the radio work it out from the screen.',
+      hint: 'e.g. type, make, livery or registration',
+      text: this.getAircraft(),
+      maxLength: 80,
+      confirmText: 'Save',
+      cancelText: 'Cancel',
+    });
+    if (r?.action === 'confirm') {
+      this.setAircraft(r.text || '');
+      toast(this.getAircraft() ? 'Aircraft saved' : 'Aircraft cleared (auto)');
+    }
+  }
+
   async openMenu(
     showOptions: (items: any[], o?: any) => Promise<any>,
     showInput: (o: any) => Promise<any>,
@@ -995,7 +1141,8 @@ class SimRadio {
     let screen = 'main';
     for (let guard = 0; guard < 40; guard++) {
       const pid = this.getPersonaId();
-      const iv = this.getInterval();
+      const gmin = this.getGapMin();
+      const gmax = this.getGapMax();
       const spk = this.getSpeaker();
       let items: any[] = [];
       if (screen === 'main') {
@@ -1005,21 +1152,36 @@ class SimRadio {
           {id: 'radio:now', title: 'Talk now'},
           {id: 'radio:voice', title: 'Character: ' + pname},
           {id: 'radio:speaker', title: 'Voice: ' + spk},
-          {id: 'radio:trip', title: this.getTrip() ? 'Trip brief: set' : 'Trip brief: not set'},
+          {id: 'radio:nerd', title: 'Nerd level: ' + this.getNerd() + ' of 5'},
+          {id: 'radio:tripair', title: 'Trip and aircraft'},
           {id: 'radio:more', title: 'More settings'},
         ];
       } else if (screen === 'voice') {
         items = PERSONAS.map(p => ({id: 'radio:persona:' + p.id, title: p.name, active: p.id === pid}));
         items.push({id: 'radio:back', title: 'Back'});
+      } else if (screen === 'nerd') {
+        const nl = this.getNerd();
+        items = NERD_LEVELS.map(n => ({id: 'radio:nerdlvl:' + n.id, title: n.name, active: n.id === nl}));
+        items.push({id: 'radio:back', title: 'Back'});
+      } else if (screen === 'tripair') {
+        items = [
+          {id: 'radio:trip', title: this.getTrip() ? 'Trip brief: set' : 'Trip brief: not set'},
+          {id: 'radio:aircraft', title: this.getAircraft() ? 'Aircraft: ' + this.getAircraft().slice(0, 30) : 'Aircraft: auto-detect'},
+          {id: 'radio:back', title: 'Back'},
+        ];
       } else if (screen === 'speaker') {
         items = SPEAKERS.map(s => ({id: 'radio:spk:' + s.id, title: s.name, active: s.id === spk}));
         items.push({id: 'radio:back', title: 'Back'});
-      } else if (screen === 'interval') {
-        items = INTERVALS.map(s => ({id: 'radio:interval:' + s, title: 'Every ' + s + ' seconds', active: s === iv}));
-        items.push({id: 'radio:back', title: 'Back'});
+      } else if (screen === 'gapmin') {
+        items = GAP_MINS.map(s => ({id: 'radio:gmin:' + s, title: 'Shortest pause: ' + s + ' seconds', active: s === gmin}));
+        items.push({id: 'radio:more', title: 'Back'});
+      } else if (screen === 'gapmax') {
+        items = GAP_MAXS.map(s => ({id: 'radio:gmax:' + s, title: 'Longest pause: ' + s + ' seconds', active: s === gmax}));
+        items.push({id: 'radio:more', title: 'Back'});
       } else {
         items = [
-          {id: 'radio:interval', title: 'Talk every ' + iv + 's'},
+          {id: 'radio:gapmin', title: 'Shortest pause: ' + gmin + 's'},
+          {id: 'radio:gapmax', title: 'Longest pause: ' + gmax + 's'},
           {id: 'radio:key', title: this.getApiKey() ? 'API key: set' : 'API key: NOT SET'},
           {id: 'radio:captions', title: 'Captions', active: this.getCaptions()},
           {id: 'radio:forget', title: 'Forget trip notebook'},
@@ -1058,11 +1220,22 @@ class SimRadio {
         screen = 'voice';
       } else if (id === 'radio:speaker') {
         screen = 'speaker';
-      } else if (id === 'radio:interval') {
-        screen = 'interval';
+      } else if (id === 'radio:gapmin') {
+        screen = 'gapmin';
+      } else if (id === 'radio:gapmax') {
+        screen = 'gapmax';
       } else if (id === 'radio:more') {
         screen = 'more';
       } else if (id === 'radio:back') {
+        screen = 'main';
+      } else if (id === 'radio:nerd') {
+        screen = 'nerd';
+      } else if (id === 'radio:tripair') {
+        screen = 'tripair';
+      } else if (id === 'radio:aircraft') {
+        await this.promptForAircraft(showInput);
+      } else if (id.startsWith('radio:nerdlvl:')) {
+        this.setNerd(parseInt(id.slice('radio:nerdlvl:'.length), 10) || 3);
         screen = 'main';
       } else if (id === 'radio:trip') {
         await this.promptForTrip(showInput);
@@ -1084,8 +1257,11 @@ class SimRadio {
       } else if (id.startsWith('radio:spk:')) {
         this.setSpeaker(id.slice('radio:spk:'.length));
         screen = 'main';
-      } else if (id.startsWith('radio:interval:')) {
-        this.setInterval(parseInt(id.slice('radio:interval:'.length), 10) || 15);
+      } else if (id.startsWith('radio:gmin:')) {
+        this.setGapMin(parseInt(id.slice('radio:gmin:'.length), 10) || 4);
+        screen = 'more';
+      } else if (id.startsWith('radio:gmax:')) {
+        this.setGapMax(parseInt(id.slice('radio:gmax:'.length), 10) || 40);
         screen = 'more';
       }
       await pause();
