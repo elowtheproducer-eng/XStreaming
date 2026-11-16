@@ -22,6 +22,8 @@ What it does
        - the model now also reports PLACES / LOG / RECALL, which feed the brain
        - new menu entries: "Brain, logbook and backup" and "Black radio screen (OLED)"
   5. writes docs/brain-further-plans.md
+  6. per-model API keys (4 slots in More settings), varied line lengths, no banking chatter,
+     short error-specific model cool-downs
 
 Safe to re-run (BRAIN marker). If an anchor is missing it STOPS and prints context: paste that log back.
 """
@@ -1241,6 +1243,15 @@ Things that were left out on purpose, or only partly done, with the reason.
 - **Pictures in the backup.** Left out as requested. The brain is text only (a few hundred KB after years of flying).
 - **Cloud sync.** The share button sends the backup to Drive or email by hand. Automatic sync would need a sign-in.
 - **API key in the backup.** Deliberately excluded because the file sits in Downloads where other apps can read it.
+  This includes the four per-model keys, so after a reinstall they have to be pasted again.
+
+## Voice alternatives (not wired in)
+- **On-device neural voice (best fit).** Kokoro-82M or Piper, run through ONNX / sherpa-onnx, no network and no quota,
+  so a line can start speaking the moment the text exists. Costs a model download (tens to a few hundred MB) and
+  needs a native audio path; speed on your phone is untested.
+- **Google Cloud Text-to-Speech.** Free monthly allowance is 4M characters for Standard and WaveNet voices and 1M for
+  Neural2 / Chirp 3 HD / Studio, but it needs a billing account on the project and is not a hard cap.
+- **Phone voice.** Already the offline fallback. Instant but flat.
 '''
 
 
@@ -1256,10 +1267,31 @@ const BURST_Q = 60;
 const BURST_EVERY_MS = 10000;
 const BURST_KEEP = 36; // about 6 minutes of history
 const BURST_SEND = 8; // at most this many small screenshots go with each prompt
-const BURST_MAX_AGE_MS = 6 * 60 * 1000;"""
+const BURST_MAX_AGE_MS = 6 * 60 * 1000;
+
+// BRAIN: line length. One band is picked per turn (never the same band twice in a row), so lines vary like real talk.
+const LENGTHS: Array<{w: number; t: string}> = [
+  {w: 0.25, t: 'SHORT: about 15 to 25 words, one or two quick sentences, still carrying a specific name, number or reaction'},
+  {w: 0.35, t: 'MEDIUM: about 30 to 55 words'},
+  {w: 0.25, t: 'LONG: about 60 to 100 words, take your time and tell it properly'},
+  {w: 0.15, t: 'STORY: about 110 to 160 words, a proper little story or explanation with a beginning and an end'},
+];
+
+// BRAIN: one key per model. Free-tier limits are counted per Google project, so give each slot a key from its own project.
+export const KEY_SLOTS: Array<{id: number; model: string; name: string}> = [
+  {id: 1, model: 'gemini-4-hydrogen', name: 'Gemini 4 Hydrogen (brain, best)'},
+  {id: 2, model: 'gemini-flash-latest', name: 'Gemini 3.8 Flash (brain)'},
+  {id: 3, model: 'gemini-3.1-flash-lite', name: 'Gemini 3.1 Flash Lite (brain, backup)'},
+  {id: 4, model: 'gemini-3.8-flash-tts', name: 'Gemini 3.8 Flash TTS (voice)'},
+];
+
+// BRAIN: what to talk about from the cockpit, and what to leave out
+const FLIGHT_TALK =
+  '\nFLIGHT TALK: do NOT comment on banking, rolling, bank angle or routine control inputs (never "you are banking hard left" or "nice turn"), and do not narrate small manoeuvres. Circling or orbiting an area is fine to mention, and a turn only when it matters to where we are going. DO call out altitude or flight level, airspeed, climb and descent, vertical speed, heading in a general sense and phase of flight whenever you can read them from the HUD or instruments, in a natural, specific way ("passing four thousand, holding one hundred and ten knots") so the radio feels like it is really in the aircraft. Never invent a reading you cannot see.';"""
 
 SEGMENT_ADD = r"""  {t: 'memory callback: if BRAIN or RECALLED DETAIL shows we have been to or near this place, flown this route or met this situation before, tell the listener what happened or what we learned last time; if nothing matches, do a normal segment instead', nerd: false},
   {t: 'connect two places from BRAIN: say how this place relates to somewhere else we have flown, for example the route between them, a shared history or what we did on the way', nerd: false},
+  {t: 'a natural crew-style callout of what you can read on the instruments (altitude or flight level, airspeed, climb or descent, heading in general) and what it means for the flight right now, said like someone sitting in the same cockpit', nerd: false},
 """
 
 FIELDS = r"""  private pauseRatio = 0.4;
@@ -1269,6 +1301,7 @@ FIELDS = r"""  private pauseRatio = 0.4;
   private burstTimer: any = null;
   private burstBusy = false;
   private burstNote = '';
+  private lastLen = -1;
 """
 
 BURST_METHODS = r"""  // BRAIN: a small screenshot every 10 s, sent as one batch with the next prompt
@@ -1317,6 +1350,23 @@ BURST_METHODS = r"""  // BRAIN: a small screenshot every 10 s, sent as one batch
       out.push(all[Math.round((i * (all.length - 1)) / (BURST_SEND - 1))]);
     }
     return out;
+  }
+
+  // BRAIN: a different line length every turn, never the same band twice in a row
+  private pickLength(): string {
+    const w = LENGTHS.map((l, i) => (i === this.lastLen ? 0 : l.w));
+    const total = w.reduce((x, y) => x + y, 0);
+    let r = Math.random() * total;
+    let pick = 0;
+    for (let i = 0; i < w.length; i++) {
+      r -= w[i];
+      if (w[i] > 0 && r <= 0) {
+        pick = i;
+        break;
+      }
+    }
+    this.lastLen = pick;
+    return LENGTHS[pick].t + '. Never fewer than 15 words. If the pilot is busy (takeoff, landing, heavy ATC) keep it SHORT whatever the band says.';
   }
 
   private sleep(ms: number) {"""
@@ -1406,6 +1456,12 @@ MENU_SCREENS = r"""      } else if (screen === 'brain') {
           {id: 'radio:b:status', title: 'Brain size and last backup'},
           {id: 'radio:back', title: 'Back'},
         ];
+      } else if (screen === 'keys') {
+        items = KEY_SLOTS.map(s => ({
+          id: 'radio:slot:' + s.id,
+          title: 'Key ' + s.id + ': ' + s.name + (this.getSlotKey(s.id) ? ' [set]' : ' [empty]'),
+        }));
+        items.push({id: 'radio:more', title: 'Back'});
       } else if (screen === 'logbook') {
         items = brain.logbookItems();
         items.push({id: 'radio:brain', title: 'Back'});
@@ -1414,6 +1470,10 @@ MENU_SCREENS = r"""      } else if (screen === 'brain') {
 
 MENU_HANDLERS = r"""      } else if (id === 'radio:brain') {
         screen = 'brain';
+      } else if (id === 'radio:keys') {
+        screen = 'keys';
+      } else if (id.startsWith('radio:slot:')) {
+        await this.promptForSlotKey(parseInt(id.slice('radio:slot:'.length), 10) || 1, showInput);
       } else if (id === 'radio:oled') {
         await brain.showBlackout();
         return;
@@ -1436,6 +1496,116 @@ MENU_HANDLERS = r"""      } else if (id === 'radio:brain') {
           toast(brain.statusText(), true);
         }
       } else if (id.startsWith('radio:nerdlvl:')) {
+"""
+
+
+
+SET_COOLDOWN_START = "  private setCooldown(model: string, e: ApiError) {\n"
+SET_COOLDOWN_END = "    this.cooldown[model] = Date.now() + ms;\n  }\n"
+
+SET_COOLDOWN_NEW = r"""  // BRAIN: short, error-specific cool-downs. The old 3 min to 6 h values silenced the radio for hours
+  // after a handful of harmless blips (Google's own usage page showed no quota errors at all).
+  private setCooldown(model: string, e: ApiError) {
+    const b = e.body || '';
+    let ms = 60 * 1000;
+    if (e.status === 429) {
+      const m = b.match(/retry in ([0-9.]+)s/i);
+      const wait = m ? Math.ceil(parseFloat(m[1])) * 1000 + 2000 : 60000;
+      ms = /PerDay|per day|daily/i.test(b) ? 6 * 3600 * 1000 : Math.min(120000, Math.max(10000, wait));
+    } else if (e.status === 503 || e.status === 500 || e.status === 504) {
+      ms = 45 * 1000;
+    } else if (e.status === 404 || e.status === 403) {
+      ms = 30 * 60 * 1000;
+    } else if (e.status === 400) {
+      ms = /not supported|unsupported|invalid model|not found/i.test(b) ? 30 * 60 * 1000 : 2 * 60 * 1000;
+    } else if (e.status === 0) {
+      ms = 30 * 1000;
+    }
+    this.cooldown[model] = Date.now() + ms;
+  }
+"""
+
+CAND_OLD = """    const list = merged.length > 0 ? merged : MODEL_CHAIN;
+    return list.filter(m => (this.cooldown[m] || 0) <= now);
+"""
+CAND_NEW = """    const list = merged.length > 0 ? merged : MODEL_CHAIN;
+    const ok = list.filter(m => (this.cooldown[m] || 0) <= now);
+    if (ok.length > 0) {
+      return ok;
+    }
+    // BRAIN: everything is benched: still try the one that comes back soonest instead of going silent
+    const soon = list.slice().sort((a, b) => (this.cooldown[a] || 0) - (this.cooldown[b] || 0))[0];
+    return soon ? [soon] : [];
+"""
+
+
+KEY_METHODS = r"""  getApiKey(): string {
+    // BRAIN: the default key, or (if only per-model keys are filled in) the first of those
+    return storage.getString(K_API) || this.firstSlotKey();
+  }
+  getMainKey(): string {
+    return storage.getString(K_API) || '';
+  }
+  getSlotKey(id: number): string {
+    return storage.getString('radio_key_' + id) || '';
+  }
+  setSlotKey(id: number, k: string) {
+    storage.set('radio_key_' + id, (k || '').trim());
+  }
+  private firstSlotKey(): string {
+    for (const s of KEY_SLOTS) {
+      const k = this.getSlotKey(s.id);
+      if (k) {
+        return k;
+      }
+    }
+    return '';
+  }
+  // the key reserved for this exact model, if you gave it one
+  private slotKey(model: string): string {
+    const s = KEY_SLOTS.find(x => x.model === model);
+    return s ? this.getSlotKey(s.id) : '';
+  }
+  // key to use for a model: its own key, else the default key, else any key you entered
+  private keyFor(model: string): string {
+    return this.slotKey(model) || this.getApiKey();
+  }
+"""
+
+REJECT_NEW = r"""if (this.slotKey(model)) {
+              // BRAIN: a wrong key in one slot must not silence the whole radio
+              this.cooldown[model] = Date.now() + 30 * 60 * 1000;
+              this.lastError = model + ': its own key was rejected by Google';
+              this.log(this.lastError);
+              continue;
+            }
+            throw new Error('API key rejected by Google');"""
+
+MENU_KEYLINES = r"""          {id: 'radio:key', title: this.getMainKey() ? 'Default API key: set' : 'Default API key: not set'},
+          {id: 'radio:keys', title: 'Keys per model (' + KEY_SLOTS.filter(s => this.getSlotKey(s.id)).length + ' of ' + KEY_SLOTS.length + ' set)'},
+"""
+
+SLOT_PROMPT = r"""  async promptForSlotKey(id: number, showInput: (o: any) => Promise<any>) {
+    const slot = KEY_SLOTS.find(s => s.id === id);
+    if (!slot) {
+      return;
+    }
+    const r = await showInput({
+      title: 'Key ' + id + ': ' + slot.name,
+      message: 'Paste the key from the Google AI Studio project you want to use for this model only. Leave it empty to remove it (the default key is used instead).',
+      hint: 'AIza...',
+      text: this.getSlotKey(id),
+      maxLength: 200,
+      confirmText: 'Save',
+      cancelText: 'Cancel',
+    });
+    if (r?.action === 'confirm') {
+      this.setSlotKey(id, r.text || '');
+      delete this.cooldown[slot.model];
+      toast(this.getSlotKey(id) ? 'Key ' + id + ' saved' : 'Key ' + id + ' cleared');
+    }
+  }
+
 """
 
 
@@ -1483,7 +1653,7 @@ def patch_radio_ts():
     text = once(text, "' (plus an earlier screen so you can see movement)'",
                 "' (plus a batch of earlier screenshots so you can see movement)'", "prompt wording")
     text = once(text, "directly below this instant.';",
-                "directly below this instant.' +\n      brain.formatRules();", "prompt rules")
+                "directly below this instant.' +\n      FLIGHT_TALK +\n      brain.formatRules();", "prompt rules")
     text = once(text, "      '\\nNOTEBOOK: ' + (this.getNotes() || '(empty, first transmission)') +",
                 "      brain.context() +\n      '\\nNOTEBOOK: ' + (this.getNotes() || '(empty, first transmission)') +",
                 "prompt brain block")
@@ -1510,6 +1680,40 @@ def patch_radio_ts():
     text = once(text, "          {id: 'radio:tripair', title: 'Trip and aircraft'},\n", MENU_MAIN, "menu main")
     text = once(text, "      } else if (screen === 'tripair') {\n", MENU_SCREENS, "menu screens")
     text = once(text, "      } else if (id.startsWith('radio:nerdlvl:')) {\n", MENU_HANDLERS, "menu handlers")
+
+    # 13. short, error-specific cool-downs; never fully silent
+    a = text.find(SET_COOLDOWN_START)
+    b = text.find(SET_COOLDOWN_END)
+    if a < 0 or b < 0 or text.count(SET_COOLDOWN_START) != 1 or text.count(SET_COOLDOWN_END) != 1 or b < a:
+        die("Could not find setCooldown() to replace.", p, text, ("setCooldown",))
+    text = text[:a] + SET_COOLDOWN_NEW + text[b + len(SET_COOLDOWN_END):]
+    text = once(text, CAND_OLD, CAND_NEW, "candidates fallback")
+    text = once(text,
+                "          this.cooldown[model] = Date.now() + 3 * 60 * 1000;\n          this.lastError = model",
+                "          this.cooldown[model] = Date.now() + 45 * 1000; // BRAIN: timeouts bench a model for 45 s, not 3 min\n          this.lastError = model",
+                "timeout cooldown (brain)")
+    text = once(text,
+                "          this.cooldown[model] = Date.now() + 3 * 60 * 1000;\n        }\n        this.log('voice fallback",
+                "          this.cooldown[model] = Date.now() + 45 * 1000;\n        }\n        this.log('voice fallback",
+                "timeout cooldown (voice)")
+
+    # 14. one key per model, better model order, rejected-key handling, banking rule, varied lengths
+    text = once(text, "  'gemini-3.5-flash-lite',\n  'gemini-flash-latest',\n  'gemini-flash-lite-latest',\n  'gemini-3.1-flash-lite',\n",
+                "  'gemini-flash-latest',\n  'gemini-3.1-flash-lite',\n  'gemini-3.5-flash-lite',\n  'gemini-flash-lite-latest',\n", "model order")
+    text = once(text, "  getApiKey(): string {\n    return storage.getString(K_API) || '';\n  }\n", KEY_METHODS, "key methods")
+    text = once(text, "const parsed: any = this.parse(await this.generate(model, key, frame));",
+                "const parsed: any = this.parse(await this.generate(model, this.keyFor(model), frame));", "per-model key")
+    text = once(text, "throw new Error('API key rejected by Google');", REJECT_NEW, "rejected key")
+    text = once(text, "    const key = this.getApiKey();\n    for (const model of this.ttsCandidates()) {\n      try {\n",
+                "    for (const model of this.ttsCandidates()) {\n      const key = this.keyFor(model); // BRAIN: this voice model's own key\n      try {\n", "voice key")
+    text = once(text, "      text: this.getApiKey(),\n", "      text: this.getMainKey(),\n", "default key prompt")
+    text = once(text, "          {id: 'radio:key', title: this.getApiKey() ? 'API key: set' : 'API key: NOT SET'},\n", MENU_KEYLINES, "menu key lines")
+    text = once(text, "  async promptForTrip(showInput: (o: any) => Promise<any>) {\n",
+                SLOT_PROMPT + "  async promptForTrip(showInput: (o: any) => Promise<any>) {\n", "slot prompt")
+    text = once(text, "length follows what you have to say: sometimes one punchy sentence (15 words), usually 40 to 90 words, and occasionally a proper story up to 150 words (about a minute spoken). ",
+                "follow the LENGTH line of each turn (never fewer than 15 words, never padded: even a short line is a complete thought with something specific in it). ", "length rule")
+    text = once(text, "      '\\nSEGMENT FOR THIS TURN: ' + this.pickSegment() +\n",
+                "      '\\nLENGTH FOR THIS TURN: ' + this.pickLength() +\n      '\\nSEGMENT FOR THIS TURN: ' + this.pickSegment() +\n", "length line")
 
     write(p, text, crlf)
     print("radio.ts: burst, hi-res frames, brain feed and menu added")
