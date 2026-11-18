@@ -465,6 +465,7 @@ import kotlin.coroutines.resume
 
 data class RadioUiState(
     val speaking: Boolean = false,
+    val running: Boolean = false,
     val personaId: String = "bush",
     val line: String = "",
     val caption: String? = null,
@@ -484,6 +485,30 @@ object AtcRadio {
 
     private val _state = MutableStateFlow(RadioUiState())
     val state: StateFlow<RadioUiState> = _state.asStateFlow()
+
+    // Overlay -> React Native commands (toggle, talk); the sink is installed by AtcBridgeModule
+    interface CommandSink {
+        fun onCommand(cmd: String)
+    }
+
+    @Volatile
+    private var commandSink: CommandSink? = null
+
+    @JvmStatic
+    fun setCommandSink(sink: CommandSink?) {
+        commandSink = sink
+    }
+
+    fun sendCommand(cmd: String): Boolean {
+        val sink = commandSink ?: return false
+        sink.onCommand(cmd)
+        return true
+    }
+
+    @JvmStatic
+    fun setRunning(on: Boolean) {
+        _state.value = _state.value.copy(running = on)
+    }
 
     private val ttsInitMutex = Mutex()
     private val pendingUtterances = ConcurrentHashMap<String, CompletableDeferred<Boolean>>()
@@ -1061,7 +1086,7 @@ private fun OverlayBody(
                     modifier = Modifier.alpha(pulseAlpha)
                 ) {
                     Text(
-                        if (radioState.speaking) "ON AIR" else "STANDBY",
+                        if (radioState.speaking) "ON AIR" else if (radioState.running) "LIVE" else "STANDBY",
                         color = if (radioState.speaking) c.background else c.muted,
                         fontSize = 12.sp,
                         fontFamily = FontFamily.Monospace,
@@ -1114,7 +1139,7 @@ private fun OverlayBody(
                     )
                     Spacer(Modifier.height(8.dp))
                     Text(
-                        text = radioState.line.ifBlank { "Waiting for next transmission…" },
+                        text = radioState.line.ifBlank { if (radioState.running) "Watching the stream…" else "Radio is off. Tap Start radio below." },
                         color = if (radioState.line.isBlank()) c.muted else c.text,
                         fontSize = 18.sp,
                         lineHeight = 26.sp
@@ -1156,6 +1181,36 @@ private fun OverlayBody(
                                 modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
                             )
                         }
+                    }
+                }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Button(
+                        onClick = { AtcRadio.sendCommand("toggle") },
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = if (radioState.running) c.danger else c.pilot,
+                            contentColor = c.background
+                        ),
+                        modifier = Modifier
+                            .weight(1f)
+                            .heightIn(min = 52.dp)
+                    ) {
+                        Text(if (radioState.running) "Stop radio" else "Start radio", fontWeight = FontWeight.Bold)
+                    }
+                    Button(
+                        onClick = { AtcRadio.sendCommand("talk") },
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = c.surfaceHigh,
+                            contentColor = c.text
+                        ),
+                        modifier = Modifier
+                            .weight(1f)
+                            .heightIn(min = 52.dp)
+                    ) {
+                        Text("Talk now", fontWeight = FontWeight.Bold)
                     }
                 }
 
@@ -1232,10 +1287,22 @@ import com.facebook.react.bridge.ReactMethod;
 import com.facebook.react.bridge.ReadableMap;
 import com.facebook.react.bridge.WritableArray;
 import com.facebook.react.bridge.WritableMap;
+import com.facebook.react.modules.core.DeviceEventManagerModule;
 
 public class AtcBridgeModule extends ReactContextBaseJavaModule {
-    public AtcBridgeModule(ReactApplicationContext ctx) {
+    public AtcBridgeModule(final ReactApplicationContext ctx) {
         super(ctx);
+        AtcRadio.setCommandSink(cmd -> {
+            try {
+                ctx.getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter.class)
+                    .emit("AtcRadioCommand", cmd);
+            } catch (Throwable ignored) { }
+        });
+    }
+
+    @ReactMethod
+    public void setRadioRunning(boolean on) {
+        AtcRadio.setRunning(on);
     }
 
     @NonNull
@@ -2257,6 +2324,83 @@ def main() -> None:
         "    this.syncAtcKeys();",
         expected=1,
         idempotent_marker="this.syncAtcKeys();",
+    )
+    # Overlay Start/Stop/Talk buttons -> JS SimRadio (events from AtcBridgeModule)
+    replace_exact(
+        radio_ts,
+        root,
+        "import {NativeModules, ToastAndroid} from 'react-native';",
+        "import {DeviceEventEmitter, NativeModules, ToastAndroid} from 'react-native';",
+        expected=1,
+        idempotent_marker="DeviceEventEmitter",
+    )
+    replace_exact(
+        radio_ts,
+        root,
+        "    this.on = true;\n"
+        "    this.syncAtcKeys();",
+        "    this.on = true;\n"
+        "    this.notifyRunning();\n"
+        "    this.syncAtcKeys();",
+        expected=1,
+        idempotent_marker="this.notifyRunning();",
+    )
+    replace_exact(
+        radio_ts,
+        root,
+        "  stop() {\n"
+        "    this.on = false;\n",
+        "  stop() {\n"
+        "    this.on = false;\n"
+        "    this.notifyRunning();\n",
+        expected=1,
+        idempotent_marker="this.on = false;\n    this.notifyRunning();",
+    )
+    replace_exact(
+        radio_ts,
+        root,
+        "  isOn() {\n"
+        "    return this.on;\n"
+        "  }",
+        "  isOn() {\n"
+        "    return this.on;\n"
+        "  }\n"
+        "  notifyRunning() {\n"
+        "    try {\n"
+        "      ATC?.setRadioRunning?.(this.on);\n"
+        "    } catch (e) {}\n"
+        "  }\n"
+        "  async handleOverlayCommand(cmd: string) {\n"
+        "    await this.syncAtcKeys();\n"
+        "    if (cmd === 'toggle' && this.on) {\n"
+        "      this.stop();\n"
+        "      toast('Sim Radio off');\n"
+        "      return;\n"
+        "    }\n"
+        "    if (!this.getApiKey()) {\n"
+        "      toast('No API key set. Add one in SQUAWK Settings.', true);\n"
+        "      return;\n"
+        "    }\n"
+        "    if (cmd === 'toggle') {\n"
+        "      this.start();\n"
+        "      toast('Sim Radio on');\n"
+        "    } else if (cmd === 'talk') {\n"
+        "      this.talkNow();\n"
+        "    }\n"
+        "  }",
+        expected=1,
+        idempotent_marker="handleOverlayCommand",
+    )
+    replace_exact(
+        radio_ts,
+        root,
+        "const radio = new SimRadio();\n",
+        "const radio = new SimRadio();\n"
+        "DeviceEventEmitter.addListener('AtcRadioCommand', (cmd: string) => {\n"
+        "  radio.handleOverlayCommand(String(cmd));\n"
+        "});\n",
+        expected=1,
+        idempotent_marker="AtcRadioCommand",
     )
     replace_exact(
         radio_ts,
