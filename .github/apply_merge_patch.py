@@ -1716,7 +1716,15 @@ def main() -> None:
         gp_text = re.sub(r"org\.gradle\.jvmargs=.*", "org.gradle.jvmargs=-Xmx4096m -XX:MaxMetaspaceSize=1024m", gp_text, count=1)
         if not gp_text.endswith("\n"):
             gp_text += "\n"
-        gp_text += "\n# ATC MERGE\nkotlin.jvm.target.validation.mode=warning\nkotlin.daemon.jvmargs=-Xmx3g\n"
+        gp_text += (
+            "\n# ATC MERGE\nkotlin.jvm.target.validation.mode=warning\nkotlin.daemon.jvmargs=-Xmx3g\n"
+            "android.useFullClasspathForDexingTransform=true\n"
+            "android.jetifier.ignorelist=ui-android,ui-graphics-android,ui-text-android,ui-unit-android,ui-geometry-android,"
+            "ui-util-android,ui-tooling-preview-android,foundation-android,foundation-layout-android,animation-android,"
+            "animation-core-android,material3-android,material-icons-core-android,material-ripple-android,runtime-android,"
+            "runtime-saveable-android,activity-compose,activity-ktx,lifecycle-runtime-compose,lifecycle-viewmodel-compose,"
+            "lifecycle-runtime-ktx,lifecycle-process,lifecycle-livedata-core,lifecycle-viewmodel-savedstate,savedstate-ktx\n"
+        )
         write_text(gp, gp_text)
         record_edit(gp, root, 1)
 
