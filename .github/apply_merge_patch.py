@@ -1709,6 +1709,26 @@ def main() -> None:
         expected=1,
         idempotent_marker='org.jetbrains.kotlin:kotlin-gradle-plugin:1.9.24',
     )
+    # Newer D8/R8 so AGP 7.4.x can dex androidx lifecycle 2.8.x ("Error while dexing")
+    replace_exact(
+        root_build_gradle,
+        root,
+        '        classpath("com.android.tools.build:gradle")\n',
+        '        classpath("com.android.tools:r8:8.2.47")\n'
+        '        classpath("com.android.tools.build:gradle")\n',
+        expected=1,
+        idempotent_marker='com.android.tools:r8:8.2.47',
+    )
+    # JVM target mismatch between Kotlin (17) and Java (11) in RN libraries: warn instead of fail; more build memory
+    gp = root / "android" / "gradle.properties"
+    gp_text = read_text(gp)
+    if "kotlin.jvm.target.validation.mode" not in gp_text:
+        gp_text = re.sub(r"org\.gradle\.jvmargs=.*", "org.gradle.jvmargs=-Xmx4096m -XX:MaxMetaspaceSize=1024m", gp_text, count=1)
+        if not gp_text.endswith("\n"):
+            gp_text += "\n"
+        gp_text += "\n# ATC MERGE\nkotlin.jvm.target.validation.mode=warning\nkotlin.daemon.jvmargs=-Xmx3g\n"
+        write_text(gp, gp_text)
+        record_edit(gp, root, 1)
 
     app_build_gradle = root / "android" / "app" / "build.gradle"
     replace_exact(
