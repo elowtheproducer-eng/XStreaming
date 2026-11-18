@@ -1,0 +1,185 @@
+name: Build merged SQUAWK + Stream + Bush Radio APK
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    env:
+      YARN_ENABLE_IMMUTABLE_INSTALLS: "false"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Enable Yarn
+        run: corepack enable
+
+      - name: Cache Gradle and Yarn
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+            ~/.cache/yarn
+            node_modules
+          key: ${{ runner.os }}-merged-${{ hashFiles('package.json', 'yarn.lock', 'android/build.gradle', 'android/app/build.gradle') }}
+          restore-keys: |
+            ${{ runner.os }}-merged-
+
+      # ---- source patches (order matters) ----
+      - name: Apply tilt patch
+        run: python3 .github/apply_tilt_patch.py
+
+      - name: Apply head tracking patch (kept because later patches depend on it)
+        run: python3 .github/apply_headtrack_patch.py
+
+      - name: Apply Sim Radio patch
+        run: python3 .github/apply_radio_patch.py
+
+      - name: Apply Cabin Crew fixes and wiring
+        run: python3 .github/apply_cabin_fix_patch.py
+
+      - name: Apply SQUAWK + XStreaming merge patch
+        shell: bash
+        run: |
+          # works wherever apply_merge_patch.py was dropped (.github/ or repo root); it carries the ATC source inside itself
+          P=$(find . -name apply_merge_patch.py -not -path "./node_modules/*" | head -1)
+          test -n "$P" || { echo "ERROR: apply_merge_patch.py not found in the repo"; exit 1; }
+          echo "using $P"
+          python3 "$P"
+
+      - name: Save diff of all patches
+        if: always()
+        run: |
+          git add -A -N . || true
+          git diff -- . ":!atc_src" > patches.diff || true
+          git diff --stat -- . ":!atc_src" | tail -30 || true
+
+      - name: Install JS dependencies
+        run: yarn install
+
+      - name: Add Rust Android target
+        run: rustup target add aarch64-linux-android
+
+      - name: Compile :atc Kotlin first (diagnostic pre-check)
+        continue-on-error: true
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew :atc:compileDebugKotlin --continue --no-daemon \
+            -PreactNativeArchitectures=arm64-v8a 2>&1 | tee atc-compile.log
+
+      - name: Upload :atc compile log and Kotlin 1.9 report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: atc-kotlin-diagnostics
+          path: |
+            android/atc-compile.log
+            android/atc/KOTLIN19_REPORT.txt
+          if-no-files-found: ignore
+
+      - name: Build dev release APK (debug-signed, arm64 only)
+        working-directory: android
+        shell: bash
+        run: |
+          set -o pipefail
+          chmod +x gradlew
+          ./gradlew assembleDevRelease --no-daemon --continue \
+            -PreactNativeArchitectures=arm64-v8a \
+            -PXSTREAMING_RELEASE_STORE_FILE=debug.keystore \
+            -PXSTREAMING_RELEASE_KEY_ALIAS=androiddebugkey \
+            -PXSTREAMING_RELEASE_STORE_PASSWORD=android \
+            -PXSTREAMING_RELEASE_KEY_PASSWORD=android 2>&1 | tee build.log
+
+      - name: Sign if unsigned and rename output APK
+        run: |
+          cd android/app/build/outputs/apk/dev/release
+          ls -la
+          if ls *unsigned*.apk >/dev/null 2>&1; then
+            BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+            "$BT/zipalign" -f -p 4 *unsigned*.apk aligned.apk
+            "$BT/apksigner" sign \
+              --ks "$GITHUB_WORKSPACE/android/app/debug.keystore" \
+              --ks-pass pass:android --key-pass pass:android \
+              --ks-key-alias androiddebugkey \
+              --out xstreaming-squawk.apk aligned.apk
+            rm -f aligned.apk *unsigned*.apk
+          else
+            FIRST_APK=$(ls *.apk | head -1)
+            if [ -n "$FIRST_APK" ] && [ "$FIRST_APK" != "xstreaming-squawk.apk" ]; then
+              cp "$FIRST_APK" xstreaming-squawk.apk
+            fi
+          fi
+          ls -la
+
+      - name: Verify merged manifest has exactly one LAUNCHER activity
+        run: |
+          python3 - <<'PY'
+          import glob, xml.etree.ElementTree as ET, sys
+          paths = glob.glob("android/app/build/intermediates/merged_manifests/**/AndroidManifest.xml", recursive=True)
+          if not paths:
+              print("ERROR: no merged manifest found")
+              sys.exit(1)
+          ns = "{http://schemas.android.com/apk/res/android}"
+          launchers = []
+          for p in paths:
+              root = ET.parse(p).getroot()
+              for act in root.findall(".//application/activity"):
+                  name = act.get(ns + "name", "")
+                  for inf in act.findall("intent-filter"):
+                      cats = [c.get(ns + "name") for c in inf.findall("category")]
+                      if "android.intent.category.LAUNCHER" in cats:
+                          launchers.append((p, name))
+          print("Merged LAUNCHER activities:", launchers)
+          if len(launchers) == 0:
+              sys.exit(1)
+          names = {x[1] for x in launchers}
+          if len(names) != 1:
+              print("ERROR: expected exactly 1 unique LAUNCHER activity, got", names)
+              sys.exit(1)
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xstreaming-squawk-apk
+          path: android/app/build/outputs/apk/dev/release/xstreaming-squawk.apk
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: build-log
+          path: android/build.log
+          if-no-files-found: ignore
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: patches-diff
+          path: patches.diff
+          if-no-files-found: ignore
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: gradle-reports
+          path: |
+            android/app/build/reports
+            android/build/reports
+            android/atc/build/reports
+            android/app/build/intermediates/merged_manifests
+          if-no-files-found: ignore
