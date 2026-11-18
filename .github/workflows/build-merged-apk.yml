@@ -70,6 +70,9 @@ jobs:
           echo "using $B"
           python3 "$B"
 
+      - name: Apply Sim Radio model picker (last: after the Bush Radio fixes)
+        run: python3 .github/apply_models_patch.py
+
       - name: Save diff of all patches
         if: always()
         run: |
