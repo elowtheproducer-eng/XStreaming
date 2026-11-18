@@ -79,6 +79,16 @@ jobs:
           echo "using $M"
           python3 "$M"
 
+      # Runs very last, after the model picker. Replaces both menus' key and model screens with 4 settings:
+      # voice key (Gemini / Speechify / Groq, auto-detected), brain key (Gemini), voice model, brain model.
+      - name: Apply simple keys and models menu (both menus)
+        shell: bash
+        run: |
+          K=$(find . -name apply_keys_patch.py -not -path "./node_modules/*" | head -1)
+          test -n "$K" || { echo "ERROR: apply_keys_patch.py not found in the repo"; exit 1; }
+          echo "using $K"
+          python3 "$K"
+
       - name: Save diff of all patches
         if: always()
         run: |
