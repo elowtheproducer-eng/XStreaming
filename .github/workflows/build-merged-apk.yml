@@ -62,6 +62,14 @@ jobs:
           echo "using $P"
           python3 "$P"
 
+      - name: Apply Bush Radio fixes and enhancements
+        shell: bash
+        run: |
+          B=$(find . -name apply_bush_radio_fix.py -not -path "./node_modules/*" | head -1)
+          test -n "$B" || { echo "ERROR: apply_bush_radio_fix.py not found in the repo"; exit 1; }
+          echo "using $B"
+          python3 "$B"
+
       - name: Save diff of all patches
         if: always()
         run: |
