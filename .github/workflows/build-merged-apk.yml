@@ -70,8 +70,14 @@ jobs:
           echo "using $B"
           python3 "$B"
 
-      - name: Apply Sim Radio model picker (last: after the Bush Radio fixes)
-        run: python3 .github/apply_models_patch.py
+      # Runs last, after the Bush Radio fixes. Finds the script in .github/ or the repo root.
+      - name: Apply Sim Radio model picker
+        shell: bash
+        run: |
+          M=$(find . -name apply_models_patch.py -not -path "./node_modules/*" | head -1)
+          test -n "$M" || { echo "ERROR: apply_models_patch.py not found in the repo"; exit 1; }
+          echo "using $M"
+          python3 "$M"
 
       - name: Save diff of all patches
         if: always()
