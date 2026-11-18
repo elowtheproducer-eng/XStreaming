@@ -127,6 +127,30 @@ jobs:
           fi
           ls -la
 
+      - name: Diagnostics - are the Compose classes inside the APK?
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p diag
+          APK=$(ls android/app/build/outputs/apk/dev/release/*.apk 2>/dev/null | head -1)
+          echo "apk: $APK" | tee diag/apk-classes.txt
+          if [ -n "$APK" ]; then
+            mkdir -p diag/dex && unzip -q -o "$APK" 'classes*.dex' -d diag/dex || true
+            for f in diag/dex/*.dex; do
+              for c in 'androidx/compose/ui/platform/ComposeView;' 'androidx/lifecycle/ProcessLifecycleOwner;' 'androidx/activity/compose/ComponentActivityKt;'; do
+                echo "$(basename $f) $c : $(strings $f | grep -c "$c")" | tee -a diag/apk-classes.txt
+              done
+            done
+          fi
+          (cd android && ./gradlew :app:dependencies --configuration devReleaseRuntimeClasspath --no-daemon -q 2>&1 | grep -E "compose.ui|lifecycle-process|activity-compose|:atc" | head -60) > diag/runtime-deps.txt || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: diagnostics
+          path: diag/*.txt
+          if-no-files-found: ignore
+
       - name: Verify merged manifest has exactly one LAUNCHER activity
         run: |
           python3 - <<'PY'
