@@ -144,13 +144,13 @@ android {
 }
 
 dependencies {
-    implementation("androidx.core:core-ktx:1.13.1")
-    implementation("androidx.activity:activity-compose:1.9.2")
-    implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.6")
-    implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.6")
-    implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.6")
+    implementation("androidx.core:core-ktx:1.12.0")
+    implementation("androidx.activity:activity-compose:1.8.2")
+    implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.7.0")
+    implementation("androidx.lifecycle:lifecycle-runtime-compose:2.7.0")
+    implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.7.0")
 
-    def composeBom = platform("androidx.compose:compose-bom:2024.09.03")
+    def composeBom = platform("androidx.compose:compose-bom:2024.02.00")
     implementation(composeBom)
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.ui:ui-graphics")
@@ -1709,16 +1709,6 @@ def main() -> None:
         expected=1,
         idempotent_marker='org.jetbrains.kotlin:kotlin-gradle-plugin:1.9.24',
     )
-    # Newer D8/R8 so AGP 7.4.x can dex androidx lifecycle 2.8.x ("Error while dexing")
-    replace_exact(
-        root_build_gradle,
-        root,
-        '        classpath("com.android.tools.build:gradle")\n',
-        '        classpath("com.android.tools:r8:8.2.47")\n'
-        '        classpath("com.android.tools.build:gradle")\n',
-        expected=1,
-        idempotent_marker='com.android.tools:r8:8.2.47',
-    )
     # JVM target mismatch between Kotlin (17) and Java (11) in RN libraries: warn instead of fail; more build memory
     gp = root / "android" / "gradle.properties"
     gp_text = read_text(gp)
@@ -2014,6 +2004,12 @@ def main() -> None:
     )
 
     # 6.4 Run Kotlin 1.9 compatibility scanner (read-only)
+    # material3 1.2.0 (older stack that works with AGP 7.4) has Divider, not HorizontalDivider
+    for kt in (dst_main / "java").rglob("*.kt"):
+        txt = read_text(kt)
+        if "HorizontalDivider" in txt:
+            write_text(kt, txt.replace("HorizontalDivider", "Divider"))
+            record_edit(kt, root, 1)
     scan_kotlin19_compat(dst_main / "java", atc_mod / "KOTLIN19_REPORT.txt")
 
     # 6.9 Head tracking: off, unreachable
