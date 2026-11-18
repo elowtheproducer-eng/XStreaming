@@ -1770,6 +1770,17 @@ def main() -> None:
         expected=1,
         idempotent_marker='versionName "2.12.0-squawk"',
     )
+    # FIX (NoClassDefFoundError ComposeView): :app lacked the Kotlin Android plugin, so it had no
+    # org.jetbrains.kotlin.platform.type attribute and Gradle resolved Compose's *-desktop (JVM)
+    # variants instead of *-android. Applying the plugin makes :app resolve the Android artifacts.
+    replace_exact(
+        app_build_gradle,
+        root,
+        'apply plugin: "com.facebook.react"',
+        'apply plugin: "com.facebook.react"\napply plugin: "org.jetbrains.kotlin.android"',
+        expected=1,
+        idempotent_marker='apply plugin: "org.jetbrains.kotlin.android"',
+    )
     replace_exact(
         app_build_gradle,
         root,
