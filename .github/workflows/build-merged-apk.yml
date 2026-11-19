@@ -89,6 +89,16 @@ jobs:
           echo "using $K"
           python3 "$K"
 
+      # Runs after everything else. Speechify-only voice: removes the Gemini voice picker (Charon etc.) from both menus,
+      # hard-wires Speechify, and looks the voice id up in your Speechify workspace (fixes voice_not_found / silent radio).
+      - name: Apply Speechify-only voice patch
+        shell: bash
+        run: |
+          V=$(find . -name apply_speechify_only_patch.py -not -path "./node_modules/*" | head -1)
+          test -n "$V" || { echo "ERROR: apply_speechify_only_patch.py not found in the repo"; exit 1; }
+          echo "using $V"
+          python3 "$V"
+
       - name: Save diff of all patches
         if: always()
         run: |
