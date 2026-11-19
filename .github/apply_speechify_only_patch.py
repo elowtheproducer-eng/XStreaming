@@ -147,6 +147,36 @@ else:
             "    const voice = p === 'speechify' ? await this.spfyVoiceFor(r.key) : this.getProvOpt(p, 'voice');\n"
             "    const pieces: Uint8Array[] = [];", "provaudio")
 
+    # 6b. Speechify audio: ask for wav (unambiguous), accept l16/pcm replies too
+    s = sub(s, "body: JSON.stringify({input: chunk, voice_id: voice, model, audio_format: 'pcm'}),",
+            "body: JSON.stringify({input: chunk, voice_id: voice, model, audio_format: 'wav'}),", "spfy-wav")
+    s = sub(s,
+            """        const fmt = String(j.audio_format || 'pcm').toLowerCase();
+        if (fmt !== 'pcm' && fmt !== 'wav') {
+          throw new ApiError(0, 'unexpected audio format ' + fmt);
+        }
+        const w = this.wavToPcm(this.b64ToBytes(String(j.audio_data)), 24000);""",
+            """        const fmt = String(j.audio_format || 'wav').toLowerCase();
+        const fr = parseInt((fmt.match(/rate=(\\d+)/) || [])[1] || '24000', 10) || 24000;
+        const bytes = this.b64ToBytes(String(j.audio_data));
+        const isRiff = bytes.length > 44 && bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46;
+        let w: {pcm: Uint8Array; rate: number};
+        if (isRiff) {
+          w = this.wavToPcm(bytes, fr);
+        } else if (/^l16/.test(fmt)) {
+          // L16 is big-endian by definition: swap to little-endian for playback
+          const sw = new Uint8Array(bytes.length - (bytes.length % 2));
+          for (let i = 0; i < sw.length; i += 2) {
+            sw[i] = bytes[i + 1];
+            sw[i + 1] = bytes[i];
+          }
+          w = {pcm: sw, rate: fr};
+        } else if (/pcm|raw/.test(fmt)) {
+          w = {pcm: bytes, rate: fr};
+        } else {
+          throw new ApiError(0, 'unexpected audio format ' + fmt);
+        }""", "spfy-format")
+
     # 7. the speech function itself: Speechify only
     new_fetch = r'''  // SPFY1: ask Speechify which voices this key can use, match the saved voice by id or display name
   private async spfyVoiceFor(key: string): Promise<string> {
@@ -175,6 +205,7 @@ else:
             .filter(v => v.id);
           this.spfyVoicesAt = Date.now();
           this.log('Speechify voices available: ' + this.spfyVoices.length);
+          this.log('Speechify voice names: ' + this.spfyVoices.map(v => v.name || v.id).join(', '));
         }
       }
     } catch (e: any) {
@@ -213,7 +244,7 @@ else:
       m = this.getProvOpt('speechify', 'model');
     }
     const models = [m];
-    if (m !== 'simba-english') models.push('simba-english');
+    if (m !== 'simba-3.0') models.push('simba-3.0'); // simba-english is retired
     for (const model of models) {
       const route = {model: 'speechify:' + model, id: 101, key, tag: 'speechify:' + model + '@101'};
       for (let attempt = 0; attempt < 2; attempt++) {
