@@ -11,16 +11,20 @@ Both menus (the native pause menu > Sim Radio, and the Bush Radio panel with the
 ONLY these four settings, and nothing else about keys or models:
 
   1. Voice key    - ONE slot. Paste a Gemini, Speechify or Groq key; the type is detected from the key:
-                      AIza...  -> Gemini
                       gsk_...  -> Groq
+                      AIza... or the same key as the Brain key -> Gemini
                       anything else -> Speechify
-  2. Brain key    - ONE slot. Gemini only (must start with AIza).
+                    To force the type, start with gemini: or speechify: or groq: (e.g. gemini:YOURKEY).
+  2. Brain key    - ONE slot. Whatever you paste is used as a Gemini key (no prefix check).
   3. Voice model  - ONE slot. Empty = Auto (built-in list with fallbacks). Typed id, for example
                       Gemini:    gemini-2.5-flash-preview-tts
                       Speechify: simba-3.5
                       Groq:      canopylabs/orpheus-v1-english
                     (the provider comes from the voice key, so you do not type "groq:" or "speechify:").
   4. Brain model  - ONE slot. Empty = Auto (built-in list with fallbacks). Gemini model id.
+
+Voice name (not a key or model): Gemini voices stay a pick-from-list. With a Speechify or Groq voice key the same
+"Voice name" item asks for a voice id instead (empty = george / troy). In the panel the item appears under Voice model.
 
 Removed from both menus: the 5 key slots, the spare/default key, key plan, the Models screen with 3 slots each,
 fallback slots, the model picker lists, the model report, the Voice providers screen, and the panel's key chips.
@@ -124,10 +128,21 @@ MEMBERS = r"""  // KEYS1: four settings only - voice key (Gemini / Speechify / G
   private voiceModelKind(m: string): string {
     return m.indexOf('speechify:') === 0 ? 'speechify' : m.indexOf('groq:') === 0 ? 'groq' : 'gemini';
   }
+  // optional prefix to force the type: gemini:KEY, groq:KEY, speechify:KEY
+  private splitKindPrefix(raw: string): {kind: string; key: string} {
+    const t = (raw || '').trim();
+    const m = t.match(/^(gemini|groq|speechify):(.+)$/i);
+    return m ? {kind: m[1].toLowerCase(), key: m[2].trim()} : {kind: '', key: t};
+  }
   voiceKindOf(k: string): string {
     const t = (k || '').trim();
     if (!t) {
       return '';
+    }
+    if (t === this.getSlotKey(1) || t === storage.getString('radio_vkey')) {
+      return t === storage.getString('radio_vkey') && storage.getString('radio_vkind')
+        ? storage.getString('radio_vkind') || 'gemini'
+        : 'gemini';
     }
     if (/^AIza/.test(t)) {
       return 'gemini';
@@ -157,8 +172,9 @@ MEMBERS = r"""  // KEYS1: four settings only - voice key (Gemini / Speechify / G
   }
   setVoiceKey(k: string): string {
     this.keysReady();
-    const t = (k || '').trim();
-    const kind = this.voiceKindOf(t);
+    const sp = this.splitKindPrefix(k);
+    const t = sp.key;
+    const kind = sp.kind || this.voiceKindOf(t);
     storage.set('radio_vkey', t);
     storage.set('radio_vkind', kind);
     this.setSlotKey(2, kind === 'gemini' ? t : '');
@@ -231,7 +247,7 @@ MEMBERS = r"""  // KEYS1: four settings only - voice key (Gemini / Speechify / G
     const r = await showInput({
       title: 'Voice key',
       message:
-        'Paste a Gemini (AIza...), Groq (gsk_...) or Speechify key. The type is detected from the key. Empty clears it.',
+        'Paste a Gemini, Groq (gsk_...) or Speechify key. Type is detected: AIza... = Gemini, gsk_... = Groq, same as the brain key = Gemini, anything else = Speechify. To force it, start with gemini: or speechify: or groq:. Empty clears it.',
       hint: 'AIza... / gsk_... / Speechify key',
       text: this.getVoiceKey(),
       maxLength: 200,
@@ -252,8 +268,8 @@ MEMBERS = r"""  // KEYS1: four settings only - voice key (Gemini / Speechify / G
   async promptForBrainKey(showInput: (o: any) => Promise<any>) {
     const r = await showInput({
       title: 'Brain key',
-      message: 'Gemini key only (aistudio.google.com/apikey). Empty clears it.',
-      hint: 'AIza...',
+      message: 'Paste your Gemini key (aistudio.google.com/apikey). Whatever you paste is used as a Gemini key. Empty clears it.',
+      hint: 'Gemini key',
       text: this.getBrainKey(),
       maxLength: 200,
       confirmText: 'Save',
@@ -261,8 +277,8 @@ MEMBERS = r"""  // KEYS1: four settings only - voice key (Gemini / Speechify / G
     });
     if (r?.action === 'confirm') {
       const v = String(r.text || '').trim();
-      if (v && !/^AIza\S+$/.test(v)) {
-        toast('The brain key must be a Gemini key (starts with AIza)', true);
+      if (/\s/.test(v)) {
+        toast('A key cannot contain spaces', true);
         return;
       }
       this.setBrainKey(v);
@@ -307,6 +323,40 @@ MEMBERS = r"""  // KEYS1: four settings only - voice key (Gemini / Speechify / G
       toast(v ? 'Voice model: ' + this.getVoiceModel() : 'Voice model: Auto');
     }
   }
+  voiceNameLabel(): string {
+    const k = this.getVoiceKind();
+    return k === 'groq' || k === 'speechify' ? this.getProvOpt(k, 'voice') : this.getSpeaker();
+  }
+  isProviderVoice(): boolean {
+    const k = this.getVoiceKind();
+    return k === 'groq' || k === 'speechify';
+  }
+  // Speechify / Groq: type the voice id. Gemini voices are picked from the list (speaker screen / chips).
+  async promptForVoiceName(showInput: (o: any) => Promise<any>) {
+    const k = this.getVoiceKind();
+    if (k !== 'groq' && k !== 'speechify') {
+      return;
+    }
+    const def = k === 'groq' ? 'troy' : 'george';
+    const r = await showInput({
+      title: (k === 'groq' ? 'Groq' : 'Speechify') + ' voice',
+      message: 'The voice id, for example ' + def + '. Empty = default (' + def + ').',
+      hint: def,
+      text: storage.getString('radio_popt_' + k + '_voice') || '',
+      maxLength: 60,
+      confirmText: 'Save',
+      cancelText: 'Cancel',
+    });
+    if (r?.action === 'confirm') {
+      const v = String(r.text || '').trim();
+      if (v && !/^[A-Za-z0-9._-]+$/.test(v)) {
+        toast('That is not a valid voice id', true);
+        return;
+      }
+      this.setProvOpt(k, 'voice', v);
+      toast(v ? 'Voice: ' + v : 'Voice: ' + def + ' (default)');
+    }
+  }
   async promptForBrainModel(showInput: (o: any) => Promise<any>) {
     const r = await showInput({
       title: 'Brain model',
@@ -336,7 +386,13 @@ MENU_ITEMS = (
     "          {id: 'radio:bmodel', title: 'Brain model: ' + this.brainModelLabel()},\n"
 )
 
-HANDLERS = r"""      } else if (id === 'radio:vkey') {
+HANDLERS = r"""      } else if (id === 'radio:speaker') {
+        if (this.isProviderVoice()) {
+          await this.promptForVoiceName(showInput);
+        } else {
+          screen = 'speaker';
+        }
+      } else if (id === 'radio:vkey') {
         await this.promptForVoiceKey(showInput);
       } else if (id === 'radio:bkey') {
         await this.promptForBrainKey(showInput);
@@ -378,6 +434,18 @@ PANEL = r"""                {/* KEYS1: the only key and model settings */}
                     Voice model: {radio.voiceModelLabel()}
                   </Text>
                 </TouchableOpacity>
+                {radio.isProviderVoice() && (
+                  <TouchableOpacity
+                    onPress={async () => {
+                      await radio.promptForVoiceName(showInput);
+                      radio.refreshUi?.();
+                    }}
+                    style={styles.wideRowBtn}>
+                    <Text style={styles.wideRowTxt}>
+                      Voice name: {radio.voiceNameLabel()}
+                    </Text>
+                  </TouchableOpacity>
+                )}
                 <TouchableOpacity
                   onPress={async () => {
                     await radio.promptForBrainModel(showInput);
@@ -484,6 +552,13 @@ def patch_radio():
              "          {id: 'radio:keys', title: 'Keys per model (' + KEY_SLOTS.filter(s => this.getSlotKey(s.id)).length + ' of ' + KEY_SLOTS.length + ' set)'},\n",
              "", "more menu: key items", ("Default API key",))
 
+    # voice name: main menu item + handler (Gemini keeps its list, Speechify / Groq get a typed voice id)
+    t = once(t, "          {id: 'radio:speaker', title: 'Voice: ' + spk},\n",
+             "          {id: 'radio:speaker', title: 'Voice name: ' + this.voiceNameLabel()},\n",
+             "main menu: voice item", ("radio:speaker",))
+    t = once(t, "      } else if (id === 'radio:speaker') {\n        screen = 'speaker';\n", "",
+             "speaker handler", ("radio:speaker",))
+
     # handlers for the four items
     t = once(t, "      } else if (id === 'radio:models') {\n",
              HANDLERS + "      } else if (id === 'radio:models') {\n",
@@ -505,6 +580,9 @@ def patch_overlay():
     t = once(t, "import radio, {KEY_SLOTS, PERSONAS, SPEAKERS} from '../utils/radio';\n",
              "import radio, {PERSONAS, SPEAKERS} from '../utils/radio';\n", "overlay import", ("KEY_SLOTS",))
     t = once(t, "{snap.keysSet}/5 keys", "{snap.keysSet}/2 keys", "panel badge", ("keys",))
+    t = once(t, "<Text style={styles.sectionLabel}>Gemini Voice</Text>",
+             "<Text style={styles.sectionLabel}>Gemini Voice (used with a Gemini voice key)</Text>",
+             "panel gemini voice label", ("Gemini Voice",))
     t = cut_between(t, "                {/* 5 API Keys + Spare */}\n", "                {/* Character */}\n",
                     PANEL, "panel key chips")
     p.write_text(t, encoding="utf-8")
