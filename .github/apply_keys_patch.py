@@ -26,6 +26,9 @@ ONLY these four settings, and nothing else about keys or models:
 Voice name (not a key or model): Gemini voices stay a pick-from-list. With a Speechify or Groq voice key the same
 "Voice name" item asks for a voice id instead (empty = george / troy). In the panel the item appears under Voice model.
 
+Voice fix: the radio loop used to skip speech completely when the speaker was Charon (the default) or the voice engine
+was "ATC cast", so no request ever reached Speechify / Groq / Gemini. With a voice key set it now always speaks.
+
 Removed from both menus: the 5 key slots, the spare/default key, key plan, the Models screen with 3 slots each,
 fallback slots, the model picker lists, the model report, the Voice providers screen, and the panel's key chips.
 (The old code is left in the file, unreachable, so nothing else breaks.)
@@ -533,6 +536,14 @@ def patch_radio():
              "  }\n"
              "  async syncExternalKeysOld() {\n    try {\n",
              "syncExternalKeys()", ("syncExternalKeys",))
+
+    # the main radio loop skipped speech when the speaker was Charon (the default) or the ATC voice engine was on,
+    # so no voice request was ever sent. With a voice key set, the radio now always speaks with it.
+    t = once(t,
+             "      if (!useAtc && this.getSpeaker() !== 'Charon') {\n        audio = await this.fetchGeminiAudio(text);\n",
+             "      if (this.getVoiceKey() || (!useAtc && this.getSpeaker() !== 'Charon')) { // KEYS1\n"
+             "        audio = await this.fetchGeminiAudio(text);\n",
+             "speech gate", ("useAtc",))
 
     # new members (before log())
     t = once(t,
