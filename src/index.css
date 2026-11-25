@@ -1,0 +1,193 @@
+@import "tailwindcss";
+
+/* §7.3 Selawik (SIL OFL) bundled locally — no network font fetch. */
+@font-face { font-family: 'Selawik'; font-weight: 300; font-display: swap; src: url('./fonts/selawik-300.woff2') format('woff2'); }
+@font-face { font-family: 'Selawik'; font-weight: 350; font-display: swap; src: url('./fonts/selawik-350.woff2') format('woff2'); }
+@font-face { font-family: 'Selawik'; font-weight: 400; font-display: swap; src: url('./fonts/selawik-400.woff2') format('woff2'); }
+@font-face { font-family: 'Selawik'; font-weight: 600; font-display: swap; src: url('./fonts/selawik-600.woff2') format('woff2'); }
+@font-face { font-family: 'Selawik'; font-weight: 700; font-display: swap; src: url('./fonts/selawik-700.woff2') format('woff2'); }
+
+@theme {
+  --font-sans: 'Selawik', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+body { font-family: var(--font-sans); font-variant-numeric: tabular-nums; }
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+:root {
+  --gg-inset-top:    max(env(safe-area-inset-top, 0px),    var(--safe-area-inset-top, 0px));
+  --gg-inset-right:  max(env(safe-area-inset-right, 0px),  var(--safe-area-inset-right, 0px));
+  --gg-inset-bottom: max(env(safe-area-inset-bottom, 0px), var(--safe-area-inset-bottom, 0px));
+  --gg-inset-left:   max(env(safe-area-inset-left, 0px),   var(--safe-area-inset-left, 0px));
+  --gg-overlay-bottom: 0px;
+
+  /* §5 Design tokens: rounded corners for v2 */
+  --gg-r-tile:    18px;  /* all tiles */
+  --gg-r-panel:   22px;  /* sheets, settings panels, modals */
+  --gg-r-control: 12px;  /* buttons, inputs, chips, nav buttons */
+  --gg-r-badge:    8px;
+
+  --gg-bg-base: #101010;
+  --gg-bg-deep: #000000;
+  --gg-bg-raised: #1A1A1A;
+  --gg-bg-panel: rgba(16, 16, 16, 0.86);
+  --gg-surface-control: rgba(46, 46, 46, 0.78);
+  --gg-surface-focus: rgba(255, 255, 255, 0.14);
+  --gg-text-primary: #FFFFFF;
+  --gg-text-broadcast: #EBEBEB;
+  --gg-text-secondary: rgba(235, 235, 235, 0.72);
+  --gg-text-tertiary: rgba(235, 235, 235, 0.48);
+  --gg-divider: rgba(255, 255, 255, 0.12);
+  --gg-accent: #107C10;
+  --gg-accent-hover: #16A316;
+  --gg-accent-pressed: #0C5E0C;
+  --gg-accent-deep: #054B16;
+  --gg-focus-ring: #18B918;
+  --gg-accent-lime: #9BF00B;
+  --gg-scrim-dim: rgba(0, 0, 0, 0.55);
+}
+
+html.light-theme {
+  --gg-bg-base: #F2F2F2;
+  --gg-bg-deep: #E5E5E5;
+  --gg-bg-raised: #FFFFFF;
+  --gg-bg-panel: rgba(255, 255, 255, 0.88);
+  --gg-surface-control: rgba(255, 255, 255, 0.78);
+  --gg-surface-focus: rgba(23, 23, 23, 0.08);
+  --gg-text-primary: #171717;
+  --gg-text-broadcast: #1F1F1F;
+  --gg-text-secondary: rgba(23, 23, 23, 0.68);
+  --gg-text-tertiary: rgba(23, 23, 23, 0.46);
+  --gg-divider: #D2D2D2;
+  --gg-scrim-dim: rgba(16, 16, 16, 0.40);
+}
+
+@layer base {
+  body {
+    font-family: 'Selawik', 'Segoe UI', system-ui, -apple-system, sans-serif;
+    background-color: var(--gg-bg-base);
+    color: var(--gg-text-broadcast);
+    overflow-x: hidden;
+  }
+
+  .font-mono, code, pre {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Xbox double focus ring: crisp bright focus ring with dark 2px inner gap on focus/hover (§7.9, §7.11) */
+.xbox-tile-focused,
+.xbox-ring:focus-visible,
+.xbox-ring:hover {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--gg-bg-base), 0 0 0 5px var(--gg-focus-ring);
+}
+
+.xbox-ring-subtle:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--gg-bg-base), 0 0 0 4px var(--gg-focus-ring);
+}
+
+/* Custom sleek scrollbar for rails */
+.rail-scroll::-webkit-scrollbar {
+  height: 5px;
+  width: 5px;
+}
+.rail-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+.rail-scroll::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.14);
+  border-radius: 999px;
+}
+.rail-scroll::-webkit-scrollbar-thumb:hover {
+  background: var(--gg-accent);
+}
+
+/* Soft right-edge fade on horizontally scrolling Home & content rails */
+.rail-fade {
+  -webkit-mask-image: linear-gradient(to right, #000 0%, #000 calc(100% - 28px), transparent 100%);
+  mask-image: linear-gradient(to right, #000 0%, #000 calc(100% - 28px), transparent 100%);
+}
+
+@media print {
+  body {
+    background: #FFFFFF !important;
+    color: #111111 !important;
+  }
+  .no-print {
+    display: none !important;
+  }
+}
+
+/* Settings -> Reduce motion */
+.gg-reduce-motion *,
+.gg-reduce-motion *::before,
+.gg-reduce-motion *::after {
+  animation-duration: 0.001ms !important;
+  animation-iteration-count: 1 !important;
+  transition-duration: 0.001ms !important;
+  scroll-behavior: auto !important;
+}
+
+/* Settings -> Accessibility: High contrast (Night & Day variants) */
+html.gg-high-contrast {
+  --gg-bg-base: #000000;
+  --gg-bg-deep: #000000;
+  --gg-bg-raised: #0D0D0D;
+  --gg-bg-panel: rgba(0, 0, 0, 0.96);
+  --gg-surface-control: rgba(24, 24, 24, 0.95);
+  --gg-text-primary: #FFFFFF;
+  --gg-text-broadcast: #FFFFFF;
+  --gg-text-secondary: rgba(255, 255, 255, 0.9);
+  --gg-text-tertiary: rgba(255, 255, 255, 0.72);
+  --gg-divider: rgba(255, 255, 255, 0.42);
+}
+
+html.light-theme.gg-high-contrast {
+  --gg-bg-base: #FFFFFF;
+  --gg-bg-deep: #F0F0F0;
+  --gg-bg-raised: #FFFFFF;
+  --gg-bg-panel: rgba(255, 255, 255, 0.98);
+  --gg-surface-control: #FFFFFF;
+  --gg-text-primary: #000000;
+  --gg-text-broadcast: #000000;
+  --gg-text-secondary: rgba(0, 0, 0, 0.88);
+  --gg-text-tertiary: rgba(0, 0, 0, 0.68);
+  --gg-divider: #404040;
+}
+
+/* Settings -> Accessibility: Bold focus ring */
+html.gg-focus-bold .xbox-tile-focused,
+html.gg-focus-bold .xbox-ring:focus-visible,
+html.gg-focus-bold .xbox-ring:hover,
+html.gg-focus-bold button:focus-visible,
+html.gg-focus-bold input:focus-visible,
+html.gg-focus-bold select:focus-visible,
+html.gg-focus-bold textarea:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--gg-bg-base), 0 0 0 7px var(--gg-focus-ring);
+}
+
+
+
+/* Light-theme safety net: form controls and any leftover white-on-white text stay readable. */
+html.light-theme input,
+html.light-theme select,
+html.light-theme textarea {
+  color: var(--gg-text-primary);
+}
+html.light-theme input::placeholder,
+html.light-theme textarea::placeholder {
+  color: var(--gg-text-tertiary);
+}
+html.light-theme select option {
+  color: #171717;
+  background: #FFFFFF;
+}
